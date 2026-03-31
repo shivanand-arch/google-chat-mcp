@@ -1,0 +1,14 @@
+{
+  "name": "exotel-tools",
+  "owner": {
+    "name": "Shivanand"
+  },
+  "plugins": [
+    {
+      "name": "google-chat",
+      "source": ".",
+      "description": "Connect Claude Code to Google Chat — read, search, summarise, and send messages",
+      "version": "1.0.0"
+    }
+  ]
+}

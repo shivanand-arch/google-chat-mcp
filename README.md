@@ -1,93 +1,84 @@
-# Google Chat MCP Server for Claude Code
+# Google Chat Plugin for Claude Code
 
-An MCP (Model Context Protocol) server that connects Claude Code to Google Chat — read, search, summarise, and send messages across all your spaces and DMs.
+Connect Claude Code to your Google Chat — read, search, summarise, and send messages across all your spaces and DMs.
 
-## Features
+## Install
 
-- **List spaces** — see all your Chat rooms, groups, and DMs
-- **Read messages** — get recent messages from any space
-- **Search** — keyword search across all spaces in parallel
-- **Send messages** — send to spaces or DM people by name
-- **Find DMs** — fuzzy-match person names to find their DM space
-- **Slash commands** — `/chat-summary`, `/chat-search`, `/chat-send`
+### Option 1: Plugin marketplace (recommended)
 
-## Quick Setup (5 minutes)
+In Claude Code, run:
 
-### Step 1: Google Cloud OAuth credentials
-
-You need a Google Cloud project with the Chat API enabled and OAuth2 Desktop credentials. If your team already has these, skip to Step 2.
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com) → create or select a project
-2. Enable the **Google Chat API** (APIs & Services → Library)
-3. Configure the **OAuth consent screen** (Internal for Workspace, or External with test users)
-4. Add these scopes:
-   - `https://www.googleapis.com/auth/chat.spaces.readonly`
-   - `https://www.googleapis.com/auth/chat.messages`
-   - `https://www.googleapis.com/auth/chat.memberships.readonly`
-5. Create **OAuth client ID** → Desktop app → note the **Client ID** and **Client Secret**
-
-### Step 2: Clone and install
-
-```bash
-git clone https://github.com/anthropics/google-chat-mcp.git ~/google-chat-mcp
-cd ~/google-chat-mcp/servers
-npm install
+```
+/plugin marketplace add shivanand-arch/google-chat-mcp
+/plugin install google-chat@exotel-tools
 ```
 
-### Step 3: Get your refresh token
+Then run `/chat-setup` to connect your Google account.
+
+### Option 2: Manual
 
 ```bash
-cd ~/google-chat-mcp/servers
-GOOGLE_CLIENT_ID="your-client-id" GOOGLE_CLIENT_SECRET="your-client-secret" node auth-setup.js
+git clone https://github.com/shivanand-arch/google-chat-mcp.git ~/google-chat-mcp
+cd ~/google-chat-mcp/servers && npm install
 ```
 
-Follow the prompts — open the URL, sign in, paste the auth code. Copy the refresh token that's printed.
-
-### Step 4: Add to Claude Code
+Then in Claude Code, run `/chat-setup` — or manually:
 
 ```bash
+# Get your refresh token
+GOOGLE_CLIENT_ID="your-id" GOOGLE_CLIENT_SECRET="your-secret" node ~/google-chat-mcp/servers/auto-setup.js
+
+# Register with Claude Code
 claude mcp add google-chat \
-  -e GOOGLE_CLIENT_ID="your-client-id" \
-  -e GOOGLE_CLIENT_SECRET="your-client-secret" \
-  -e GOOGLE_REFRESH_TOKEN="your-refresh-token" \
+  -e GOOGLE_CLIENT_ID="your-id" \
+  -e GOOGLE_CLIENT_SECRET="your-secret" \
+  -e GOOGLE_REFRESH_TOKEN="your-token" \
   -- node ~/google-chat-mcp/servers/server.js
 ```
 
-### Step 5: Verify
+## Prerequisites
 
-Restart Claude Code and ask: *"List my Google Chat spaces"*
+You need a Google Cloud project with:
+1. **Google Chat API** enabled
+2. **OAuth2 Desktop credentials** (Client ID + Client Secret)
+3. These scopes on the consent screen:
+   - `chat.spaces.readonly`
+   - `chat.messages`
+   - `chat.memberships.readonly`
+
+If your team already has a Google Cloud project set up, ask your admin for the Client ID and Client Secret.
+
+## What you get
+
+| Type | Name | Description |
+|------|------|-------------|
+| Command | `/chat-setup` | One-time setup — connects your Google Chat account |
+| Command | `/chat-summary` | Summarise recent messages across spaces |
+| Command | `/chat-search` | Search messages by keyword |
+| Command | `/chat-send` | Send a message to a space or DM |
+| Skill | `google-chat` | Auto-activates for any Chat-related request |
+| MCP Server | `google-chat` | 7 tools: list, read, search, send, find DM, send to person |
 
 ## Usage
 
-Once set up, talk to Claude naturally:
+Once set up, just talk to Claude naturally:
 
 - *"What's happening in my Chat today?"*
 - *"Search Chat for the pricing discussion"*
 - *"Summarise the Engineering space"*
 - *"Send a message to Priya: standup at 10am"*
+- *"Draft a follow-up email based on my Chat with Sahil"*
 
 Or use slash commands:
 
 - `/chat-summary` — summarise all recent spaces
-- `/chat-summary product` — summarise the Product space
-- `/chat-search pricing` — search for messages about pricing
+- `/chat-summary product` — summarise a specific space
+- `/chat-search pricing` — search for messages
 - `/chat-send Product team | standup moved to 11am` — send a message
-
-## Tools provided
-
-| Tool | Description |
-|------|-------------|
-| `list_spaces` | List all Google Chat spaces and DMs |
-| `get_messages` | Get recent messages from a space |
-| `search_messages` | Search messages across all spaces |
-| `send_message` | Send a message to a space |
-| `get_space` | Get details about a space |
-| `find_dm` | Find a person's DM space by name |
-| `send_to_person` | Send a DM by person name (auto-resolves space) |
 
 ## Troubleshooting
 
-- **"Missing required env vars"** — Make sure all three env vars are passed in the `claude mcp add` command
-- **"Insufficient authentication scopes"** — Re-run `auth-setup.js` to get a fresh token with all scopes
-- **"Space not found"** — Use `list_spaces` first to see available space names
-- **Rate limits** — Search scans multiple spaces; try searching a specific space if you hit limits
+- **"Missing required env vars"** — Run `/chat-setup` to configure credentials
+- **"Insufficient authentication scopes"** — Re-run `/chat-setup` to get a fresh token
+- **"Space not found"** — Ask Claude to list your spaces first
+- **Rate limits** — Try searching a specific space instead of all spaces
