@@ -1,11 +1,11 @@
 {
   "name": "google-chat-mcp-server",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "MCP server for Google Chat API — read, search, and send messages",
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
+    "start": "node start.js",
     "setup-auth": "node auth-setup.js"
   },
   "dependencies": {

@@ -4,14 +4,24 @@ import { google } from "googleapis";
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
-if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN) {
-  process.stderr.write("[google-chat] ERROR: Missing GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, or GOOGLE_REFRESH_TOKEN env vars\n");
-  process.exit(1);
-}
 
-const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET);
-oauth2Client.setCredentials({ refresh_token: REFRESH_TOKEN });
-const chat = google.chat({ version: "v1", auth: oauth2Client });
+// Lazily initialized — server starts even without credentials so Claude Code
+// can connect. A clear error is returned when tools are actually called.
+let _chat = null;
+function getChat() {
+  if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN) {
+    throw new Error(
+      "Google credentials not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN. " +
+      "Run: node servers/auto-setup.js <CLIENT_ID> <CLIENT_SECRET>"
+    );
+  }
+  if (!_chat) {
+    const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET);
+    oauth2Client.setCredentials({ refresh_token: REFRESH_TOKEN });
+    _chat = google.chat({ version: "v1", auth: oauth2Client });
+  }
+  return _chat;
+}
 
 const log = (msg) => process.stderr.write(`[google-chat] ${msg}\n`);
 function sendResponse(obj) { process.stdout.write(JSON.stringify(obj) + "\n"); }
@@ -34,7 +44,7 @@ function addToCache(cache, name, spaceName, type, displayName) {
 
 async function ensureSpaces() {
   if (!allSpacesRaw) {
-    const res = await chat.spaces.list({ pageSize: 200 });
+    const res = await getChat().spaces.list({ pageSize: 200 });
     allSpacesRaw = res.data.spaces || [];
   }
   return allSpacesRaw;
@@ -61,7 +71,7 @@ async function buildNameCache() {
     log(`  Fetching members for ${dmSpaces.length} unnamed DM spaces...`);
     const memberResults = await Promise.allSettled(
       dmSpaces.map(async (space) => {
-        const membersRes = await chat.spaces.members.list({ parent: space.name, pageSize: 20 });
+        const membersRes = await getChat().spaces.members.list({ parent: space.name, pageSize: 20 });
         return { space, members: membersRes.data.memberships || [] };
       })
     );
@@ -143,7 +153,7 @@ async function listSpaces() {
 async function getMessages({ spaceName, pageSize = 25, filter = "" }) {
   const params = { parent: spaceName, pageSize, orderBy: "createTime desc" };
   if (filter) params.filter = filter;
-  const res = await chat.spaces.messages.list(params);
+  const res = await getChat().spaces.messages.list(params);
   return (res.data.messages || []).map(formatMessage);
 }
 
@@ -160,7 +170,7 @@ async function searchMessages({ query, pageSize = 25 }) {
 
   if (matchingSpace) {
     log(`  search matched space: ${matchingSpace.displayName} (${matchingSpace.name})`);
-    const msgsRes = await chat.spaces.messages.list({
+    const msgsRes = await getChat().spaces.messages.list({
       parent: matchingSpace.name, pageSize, orderBy: "createTime desc"
     });
     return (msgsRes.data.messages || []).map(msg => ({
@@ -171,7 +181,7 @@ async function searchMessages({ query, pageSize = 25 }) {
   const results = [];
   await Promise.allSettled(spaces.map(async (space) => {
     try {
-      const msgsRes = await chat.spaces.messages.list({ parent: space.name, pageSize: 50, orderBy: "createTime desc" });
+      const msgsRes = await getChat().spaces.messages.list({ parent: space.name, pageSize: 50, orderBy: "createTime desc" });
       for (const msg of msgsRes.data.messages || []) {
         if (msg.text && msg.text.toLowerCase().includes(lowerQuery))
           results.push({ ...formatMessage(msg), space: space.displayName || space.name });
@@ -185,7 +195,7 @@ async function searchMessages({ query, pageSize = 25 }) {
 async function sendMessage({ spaceName, text, threadName }) {
   const body = { text };
   if (threadName) body.thread = { name: threadName };
-  const res = await chat.spaces.messages.create({
+  const res = await getChat().spaces.messages.create({
     parent: spaceName, requestBody: body,
     messageReplyOption: threadName ? "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" : undefined,
   });
@@ -193,7 +203,7 @@ async function sendMessage({ spaceName, text, threadName }) {
 }
 
 async function getSpace({ spaceName }) {
-  const res = await chat.spaces.get({ name: spaceName });
+  const res = await getChat().spaces.get({ name: spaceName });
   return formatSpace(res.data);
 }
 
@@ -243,7 +253,7 @@ async function handleMessage(msg) {
 
   if (method === "initialize") {
     const clientVersion = params?.protocolVersion || "2024-11-05";
-    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.7.0" } } });
+    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.8.0" } } });
     return;
   }
   if (method?.startsWith("notifications/")) return;
@@ -299,4 +309,4 @@ process.stdin.on("end", () => process.exit(0));
 process.on("SIGTERM", () => process.exit(0));
 process.on("uncaughtException", (e) => log(`Uncaught: ${e.stack}`));
 process.on("unhandledRejection", (e) => log(`Rejection: ${e}`));
-log("server started (v7 — SDK-free, NDJSON, DM-only person resolution, smart search)");
+log("server started (v0.8.0 — lazy auth, auto-install via start.js, DM-only person resolution, smart search)");
