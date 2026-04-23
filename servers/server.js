@@ -1,4 +1,33 @@
 import { google } from "googleapis";
+import { readFileSync } from "fs";
+import { homedir } from "os";
+
+// ── Employee directory email index (written by /employee-directory skill) ──
+const EMAIL_INDEX_PATH = `${homedir()}/.claude/skills/employee-directory/data/email_index.json`;
+let _emailIndex = null;
+function getEmailIndex() {
+  if (_emailIndex) return _emailIndex;
+  try {
+    _emailIndex = JSON.parse(readFileSync(EMAIL_INDEX_PATH, "utf8"));
+  } catch {
+    _emailIndex = {};
+  }
+  return _emailIndex;
+}
+function lookupEmailFromDirectory(personName) {
+  const index = getEmailIndex();
+  const query = personName.toLowerCase().trim();
+  if (index[query]) return index[query];
+  // partial: any index key that starts with the query word, or vice-versa
+  for (const [name, email] of Object.entries(index)) {
+    const nameParts = name.split(" ");
+    const queryParts = query.split(" ");
+    if (queryParts.every((qp) => nameParts.some((np) => np.startsWith(qp)))) {
+      return email;
+    }
+  }
+  return null;
+}
 
 // ── Credentials (set via env vars) ──
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
@@ -273,20 +302,42 @@ async function getSpace({ spaceName }) {
 
 async function findDm({ personName }) {
   const spaceName = await findSpaceByName(personName, { dmOnly: true });
-  if (!spaceName) {
-    if (!nameCache) await buildNameCache();
-    const available = Object.entries(nameCache)
-      .filter(([k, v]) => k.length > 2 && v.type === "DIRECT_MESSAGE")
-      .map(([k, v]) => `${v.displayName}`)
-      .filter((v, i, a) => a.indexOf(v) === i)
-      .slice(0, 50);
-    return { found: false, message: `No DM found for "${personName}"`, availableDMs: available };
+  if (spaceName) return { found: true, spaceName };
+
+  // Fallback: look up email from employee directory → call findDirectMessage
+  const email = lookupEmailFromDirectory(personName);
+  if (email) {
+    try {
+      const res = await getChat().spaces.findDirectMessage({ name: `users/${email}` });
+      if (res.data?.name) {
+        return { found: true, spaceName: res.data.name, resolvedVia: "directory", email };
+      }
+    } catch {}
   }
-  return { found: true, spaceName };
+
+  if (!nameCache) await buildNameCache();
+  const available = Object.entries(nameCache)
+    .filter(([k, v]) => k.length > 2 && v.type === "DIRECT_MESSAGE")
+    .map(([k, v]) => `${v.displayName}`)
+    .filter((v, i, a) => a.indexOf(v) === i)
+    .slice(0, 50);
+  return { found: false, message: `No DM found for "${personName}"`, availableDMs: available };
 }
 
 async function sendToPerson({ personName, text, threadName }) {
-  const spaceName = await findSpaceByName(personName, { dmOnly: true });
+  let spaceName = await findSpaceByName(personName, { dmOnly: true });
+
+  if (!spaceName) {
+    // Fallback: look up email from employee directory → call findDirectMessage
+    const email = lookupEmailFromDirectory(personName);
+    if (email) {
+      try {
+        const res = await getChat().spaces.findDirectMessage({ name: `users/${email}` });
+        if (res.data?.name) spaceName = res.data.name;
+      } catch {}
+    }
+  }
+
   if (!spaceName) {
     if (!nameCache) await buildNameCache();
     const names = Object.entries(nameCache)
