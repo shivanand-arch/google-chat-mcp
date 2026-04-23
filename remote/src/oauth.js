@@ -11,7 +11,6 @@
 
 import express from "express";
 import crypto from "crypto";
-import { storage } from "./storage.js";
 
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -36,7 +35,7 @@ function verifyPkce(verifier, challenge, method) {
   return false;
 }
 
-export function createOAuthRouter({ publicUrl, googleClientId, googleClientSecret, allowedHd }) {
+export function createOAuthRouter({ publicUrl, googleClientId, googleClientSecret, allowedHd, storage }) {
   const router = express.Router();
   const googleRedirectUri = `${publicUrl}/oauth/google/callback`;
 
@@ -65,12 +64,12 @@ export function createOAuthRouter({ publicUrl, googleClientId, googleClientSecre
   });
 
   // ── Dynamic Client Registration (RFC 7591) ────────────────────────────────
-  router.post("/register", express.json(), (req, res) => {
+  router.post("/register", express.json(), async (req, res) => {
     const { redirect_uris, client_name } = req.body || {};
     if (!Array.isArray(redirect_uris) || redirect_uris.length === 0) {
       return res.status(400).json({ error: "invalid_redirect_uri" });
     }
-    const client = storage.registerClient({
+    const client = await storage.registerClient({
       redirectUris: redirect_uris,
       clientName: client_name || "unknown",
     });
@@ -86,19 +85,19 @@ export function createOAuthRouter({ publicUrl, googleClientId, googleClientSecre
   });
 
   // ── /authorize — entry point from claude.ai ──────────────────────────────
-  router.get("/authorize", (req, res) => {
+  router.get("/authorize", async (req, res) => {
     const { client_id, redirect_uri, response_type, code_challenge, code_challenge_method, state, scope } = req.query;
 
     if (response_type !== "code") {
       return res.status(400).send("unsupported_response_type");
     }
-    const client = storage.getClient(client_id);
+    const client = await storage.getClient(client_id);
     if (!client) return res.status(400).send("unknown client_id");
     if (!client.redirectUris.includes(redirect_uri)) {
       return res.status(400).send("redirect_uri not registered for client");
     }
 
-    const googleState = storage.savePendingAuth({
+    const googleState = await storage.savePendingAuth({
       clientId: client_id,
       redirectUri: redirect_uri,
       codeChallenge: code_challenge,
@@ -125,7 +124,7 @@ export function createOAuthRouter({ publicUrl, googleClientId, googleClientSecre
     if (error) return res.status(400).send(`Google returned error: ${error}`);
     if (!code || !state) return res.status(400).send("Missing code/state");
 
-    const pending = storage.takePendingAuth(state);
+    const pending = await storage.takePendingAuth(state);
     if (!pending) return res.status(400).send("Invalid or expired state");
 
     const tokenRes = await fetch(GOOGLE_TOKEN_URL, {
@@ -154,7 +153,7 @@ export function createOAuthRouter({ publicUrl, googleClientId, googleClientSecre
       return res.status(403).send(`Access restricted to ${allowedHd} accounts`);
     }
 
-    const code2 = storage.saveAuthCode({
+    const code2 = await storage.saveAuthCode({
       clientId: pending.clientId,
       redirectUri: pending.redirectUri,
       codeChallenge: pending.codeChallenge,
@@ -179,16 +178,16 @@ export function createOAuthRouter({ publicUrl, googleClientId, googleClientSecre
     const { grant_type, code, code_verifier, refresh_token, client_id } = req.body;
 
     if (grant_type === "authorization_code") {
-      const data = storage.takeAuthCode(code);
+      const data = await storage.takeAuthCode(code);
       if (!data) return res.status(400).json({ error: "invalid_grant" });
       if (data.clientId !== client_id) return res.status(400).json({ error: "invalid_client" });
       if (!verifyPkce(code_verifier, data.codeChallenge, data.codeChallengeMethod)) {
         return res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
       }
-      const accessToken = storage.saveAccessToken({
+      const accessToken = await storage.saveAccessToken({
         clientId: data.clientId, google: data.google, user: data.user, scope: data.scope,
       });
-      const refreshTok = storage.saveRefreshToken({
+      const refreshTok = await storage.saveRefreshToken({
         clientId: data.clientId, google: data.google, user: data.user, scope: data.scope,
       });
       return res.json({
@@ -201,13 +200,13 @@ export function createOAuthRouter({ publicUrl, googleClientId, googleClientSecre
     }
 
     if (grant_type === "refresh_token") {
-      const data = storage.takeRefreshToken(refresh_token);
+      const data = await storage.takeRefreshToken(refresh_token);
       if (!data) return res.status(400).json({ error: "invalid_grant" });
       if (data.clientId !== client_id) return res.status(400).json({ error: "invalid_client" });
-      const accessToken = storage.saveAccessToken({
+      const accessToken = await storage.saveAccessToken({
         clientId: data.clientId, google: data.google, user: data.user, scope: data.scope,
       });
-      const newRefresh = storage.saveRefreshToken({
+      const newRefresh = await storage.saveRefreshToken({
         clientId: data.clientId, google: data.google, user: data.user, scope: data.scope,
       });
       return res.json({

@@ -3,12 +3,14 @@
 import express from "express";
 import { createOAuthRouter } from "./oauth.js";
 import { createMcpHandler } from "./mcp.js";
+import { makeStorage } from "./storage.js";
 
 const {
   GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET,
   PUBLIC_URL,
   ALLOWED_HD,
+  REDIS_URL,
   PORT = 8080,
 } = process.env;
 
@@ -19,11 +21,13 @@ if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !PUBLIC_URL) {
 
 const publicUrl = PUBLIC_URL.replace(/\/+$/, "");
 
+const storage = await makeStorage({ redisUrl: REDIS_URL || null });
+
 const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", 1); // Railway terminates TLS upstream
 
-app.get("/healthz", (_req, res) => res.json({ ok: true }));
+app.get("/healthz", (_req, res) => res.json({ ok: true, storage: storage.backend }));
 
 app.get("/", (_req, res) => {
   res.type("html").send(`<!doctype html>
@@ -48,12 +52,14 @@ app.use(createOAuthRouter({
   googleClientId: GOOGLE_CLIENT_ID,
   googleClientSecret: GOOGLE_CLIENT_SECRET,
   allowedHd: ALLOWED_HD || null,
+  storage,
 }));
 
 // MCP endpoint — accepts POST with JSON-RPC body, requires Bearer token
 const mcpHandler = createMcpHandler({
   googleClientId: GOOGLE_CLIENT_ID,
   googleClientSecret: GOOGLE_CLIENT_SECRET,
+  storage,
 });
 app.post("/mcp", express.json({ limit: "1mb" }), mcpHandler);
 

@@ -155,6 +155,9 @@ function formatSpace(s, cache) {
 }
 
 // Per-session cache so repeated tool calls don't re-list spaces.
+// In-process only (intentionally) — a Map here decouples cache lifetime from
+// OAuth access-token rotation and from Redis round-trips on the storage layer.
+// Keyed by the Google refresh token because it's stable per user+grant.
 function makeSessionCache() {
   return {
     spaces: null,
@@ -164,6 +167,27 @@ function makeSessionCache() {
     selfNames: new Set(),
     selfIdentity: null, // { userId, email, name, source }
   };
+}
+
+const sessionCaches = new Map();
+
+function getOrCreateCache(session) {
+  const key = session?.google?.refreshToken || session?.user?.sub || "anonymous";
+  let cache = sessionCaches.get(key);
+  if (!cache) {
+    cache = makeSessionCache();
+    if (session?.user) {
+      cache.selfIdentity = {
+        userId: session.user.sub,
+        email: session.user.email,
+        name: session.user.name,
+        source: "oauth-session",
+      };
+      if (session.user.name) cache.selfNames.add(session.user.name);
+    }
+    sessionCaches.set(key, cache);
+  }
+  return cache;
 }
 
 async function ensureSpacesRaw(chat, cache) {
@@ -632,20 +656,9 @@ export async function callTool({ name, args, session, googleClientId, googleClie
   const handler = HANDLERS[name];
   if (!handler) throw new Error(`Unknown tool: ${name}`);
   const chat = makeChatClient({ google: session.google, googleClientId, googleClientSecret });
-  session.cache ||= makeSessionCache();
-  // Seed authoritative self identity from the OAuth session exactly once.
-  // No userinfo API call needed — oauth.js already captured this during login.
-  if (!session.cache.selfIdentity && session.user) {
-    session.cache.selfIdentity = {
-      userId: session.user.sub,
-      email: session.user.email,
-      name: session.user.name,
-      source: "oauth-session",
-    };
-    if (session.user.name) session.cache.selfNames.add(session.user.name);
-  }
+  const cache = getOrCreateCache(session);
   try {
-    return await handler(chat, session.cache, args || {});
+    return await handler(chat, cache, args || {});
   } catch (err) {
     if (err?.response?.data) {
       throw new Error(formatApiError(err));

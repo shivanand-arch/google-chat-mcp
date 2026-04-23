@@ -3,10 +3,9 @@
 // Bearer token resolves to a session with Google credentials.
 
 import { TOOLS, callTool } from "./tools.js";
-import { storage } from "./storage.js";
 
 const PROTOCOL_VERSION = "2024-11-05";
-const SERVER_INFO = { name: "google-chat", version: "0.5.0" };
+const SERVER_INFO = { name: "google-chat", version: "0.7.0" };
 
 function jsonRpcError(id, code, message) {
   return { jsonrpc: "2.0", id: id ?? null, error: { code, message } };
@@ -15,7 +14,7 @@ function jsonRpcResult(id, result) {
   return { jsonrpc: "2.0", id, result };
 }
 
-export function createMcpHandler({ googleClientId, googleClientSecret }) {
+export function createMcpHandler({ googleClientId, googleClientSecret, storage }) {
   return async function mcpHandler(req, res) {
     const authHeader = req.headers.authorization || "";
     const match = authHeader.match(/^Bearer\s+(.+)$/i);
@@ -23,7 +22,7 @@ export function createMcpHandler({ googleClientId, googleClientSecret }) {
       res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${req.protocol}://${req.get("host")}/.well-known/oauth-protected-resource"`);
       return res.status(401).json(jsonRpcError(null, -32001, "Missing bearer token"));
     }
-    const token = storage.getAccessToken(match[1]);
+    const token = await storage.getAccessToken(match[1]);
     if (!token) {
       res.setHeader("WWW-Authenticate", `Bearer error="invalid_token"`);
       return res.status(401).json(jsonRpcError(null, -32001, "Invalid or expired token"));

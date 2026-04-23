@@ -1,6 +1,6 @@
 {
   "name": "google-chat-mcp-remote",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Remote MCP server for Google Chat — HTTP + OAuth 2.1, deployable to Railway",
   "private": true,
   "type": "module",
@@ -12,6 +12,9 @@
   "dependencies": {
     "express": "^4.21.2",
     "googleapis": "^144.0.0"
+  },
+  "optionalDependencies": {
+    "ioredis": "^5.4.1"
   },
   "engines": {
     "node": ">=20"
