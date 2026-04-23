@@ -225,6 +225,7 @@ let nameCache = null;
 let dmLabels = {}; // spaceName → "Person A, Person B" (non-self members of each DM)
 let selfNames = new Set(); // display names of self — seeded from selfIdentity when available
 let dmMembers = {}; // spaceName → array of raw member displayNames (for get_space responses)
+let lastDiag = null; // diagnostics from last buildNameCache run, exposed via debug_dm_resolution
 
 function addToCache(cache, name, spaceName, type, displayName) {
   if (!name) return;
@@ -271,6 +272,18 @@ async function buildNameCache() {
     (s.spaceType || s.type) === "DIRECT_MESSAGE" &&
     (!s.displayName || s.displayName.startsWith("spaces/"))
   );
+  const diag = {
+    spacesTotal: spaces.length,
+    dmSpacesUnnamed: dmSpaces.length,
+    memberListOk: 0,
+    memberListErr: 0,
+    firstError: null,
+    firstErrorStatus: null,
+    firstSampleMember: null,
+    selfNamesCount: 0,
+    selfSource: null,
+    dmLabelsCount: 0,
+  };
   if (dmSpaces.length > 0) {
     log(`  Fetching members for ${dmSpaces.length} unnamed DM spaces...`);
     const memberResults = await Promise.allSettled(
@@ -288,11 +301,27 @@ async function buildNameCache() {
     // Fallback: frequency — the caller appears in EVERY DM.
     const nameFreq = {};
     const perSpaceNames = [];
-    let errors = 0;
     for (const r of memberResults) {
-      if (r.status !== "fulfilled") { errors++; continue; }
+      if (r.status !== "fulfilled") {
+        diag.memberListErr++;
+        if (!diag.firstError) {
+          diag.firstError = r.reason?.message || String(r.reason);
+          diag.firstErrorStatus = r.reason?.response?.status || r.reason?.code || null;
+        }
+        continue;
+      }
+      diag.memberListOk++;
       const names = [];
       for (const m of r.value.members) {
+        if (!diag.firstSampleMember) {
+          diag.firstSampleMember = {
+            hasMember: !!m.member,
+            memberKeys: m.member ? Object.keys(m.member) : [],
+            displayName: m.member?.displayName || null,
+            memberName: m.member?.name || null,
+            memberType: m.member?.type || null,
+          };
+        }
         const n = m.member?.displayName;
         if (!n) continue;
         if (isSelfMember(m)) { selfNames.add(n); continue; } // authoritative skip
@@ -307,7 +336,9 @@ async function buildNameCache() {
       const detectedSelf = Object.entries(nameFreq).filter(([_, c]) => c > 1).map(([n]) => n);
       for (const n of detectedSelf) selfNames.add(n);
     }
-    if (selfNames.size > 0) log(`  Self (source=${selfIdentity?.source || "frequency"}): ${[...selfNames].join(", ")}`);
+    diag.selfNamesCount = selfNames.size;
+    diag.selfSource = selfIdentity?.source || "frequency";
+    if (selfNames.size > 0) log(`  Self (source=${diag.selfSource}): ${[...selfNames].join(", ")}`);
 
     // Second pass: add only non-self names; also build dmLabels map.
     let hits = 0, emptyDms = 0;
@@ -328,8 +359,10 @@ async function buildNameCache() {
     }
     dmLabels = labels;
     dmMembers = members;
-    log(`  DM resolution: ${hits} names cached, ${errors} API errors, ${emptyDms} DMs with no resolvable member`);
+    diag.dmLabelsCount = Object.keys(labels).length;
+    log(`  DM resolution: ${hits} names cached, ${diag.memberListErr} API errors, ${emptyDms} DMs with no resolvable member`);
   }
+  lastDiag = diag;
 
   // ── 2. Then add group/named spaces. Full-name keys still get set,
   //      word-level keys only if the DM hasn't claimed them. ──
@@ -625,6 +658,7 @@ async function refreshCache() {
   dmMembers = {};
   selfNames = new Set();
   selfIdentity = null;
+  lastDiag = null;
   await buildNameCache();
   return { refreshed: true, spaces: allSpacesRaw.length, self: selfIdentity };
 }
@@ -659,21 +693,56 @@ async function getMembers({ spaceName, pageSize = 50 }) {
   }));
 }
 
+// Diagnostic: force a fresh DM-resolution pass and report counters.
+// Useful when DM displayNames look wrong — exposes whether members.list
+// succeeded, whether self-detection fired, and whether the expected scopes
+// were granted on the refresh token.
+async function debugDmResolution() {
+  nameCache = null;
+  dmLabels = {};
+  dmMembers = {};
+  await buildNameCache();
+  const spaces = await ensureSpaces();
+  const dmsUnnamedTotal = spaces.filter(
+    (s) => (s.spaceType || s.type) === "DIRECT_MESSAGE" && (!s.displayName || s.displayName.startsWith("spaces/")),
+  ).length;
+  const sampleLabelled = Object.entries(dmLabels).slice(0, 5);
+  const sampleUnresolvedDms = spaces
+    .filter((s) => {
+      const t = s.spaceType || s.type;
+      if (t !== "DIRECT_MESSAGE") return false;
+      if (s.displayName && !s.displayName.startsWith("spaces/")) return false;
+      return !dmLabels[s.name];
+    })
+    .slice(0, 5)
+    .map((s) => s.name);
+  return {
+    diagnostics: lastDiag,
+    self: selfIdentity,
+    dmsUnnamedTotal,
+    dmLabelsResolved: Object.keys(dmLabels).length,
+    sampleLabelled: sampleLabelled.map(([spaceName, label]) => ({ spaceName, label })),
+    sampleUnresolvedDms,
+    hint: "If memberListErr > 0 and firstError mentions 'permission'/'403', the chat.memberships.readonly scope was not granted — re-run auto-setup with updated scopes.",
+  };
+}
+
 // ── Tool definitions ──
 const TOOLS = [
   { name: "list_spaces", description: "List all Google Chat spaces and DMs.", inputSchema: { type: "object", properties: {}, required: [] } },
   { name: "get_messages", description: "Get recent messages from a space.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, pageSize: { type: "number" }, filter: { type: "string" } }, required: ["spaceName"] } },
   { name: "search_messages", description: "Search messages across ALL spaces in parallel. If the query matches a space/group name, returns messages from that space. Otherwise searches message text across all spaces.", inputSchema: { type: "object", properties: { query: { type: "string" }, pageSize: { type: "number" } }, required: ["query"] } },
-  { name: "send_message", description: "Send a message to a space by space name.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, text: { type: "string" }, threadName: { type: "string" } }, required: ["spaceName", "text"] } },
-  { name: "get_space", description: "Get details about a space.", inputSchema: { type: "object", properties: { spaceName: { type: "string" } }, required: ["spaceName"] } },
+  { name: "send_message", description: "Send a message to a space. Supports plain text, cardsV2, threaded replies (threadName/threadKey), messageId (idempotency), and privateMessageViewer.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, text: { type: "string" }, cardsV2: { type: "array" }, threadName: { type: "string" }, threadKey: { type: "string" }, replyOption: { type: "string" }, messageId: { type: "string" }, privateToUserId: { type: "string" } }, required: ["spaceName"] } },
+  { name: "get_space", description: "Get details about a space including members (for DMs).", inputSchema: { type: "object", properties: { spaceName: { type: "string" } }, required: ["spaceName"] } },
   { name: "find_dm", description: "Find a person's DM space by name or nickname. Use before send_message when you only know a name.", inputSchema: { type: "object", properties: { personName: { type: "string" } }, required: ["personName"] } },
-  { name: "send_to_person", description: "Send a DM to a person by name — resolves their space automatically. Use when user says 'send X to [person name]'.", inputSchema: { type: "object", properties: { personName: { type: "string" }, text: { type: "string" }, threadName: { type: "string" } }, required: ["personName", "text"] } },
+  { name: "send_to_person", description: "Send a DM to a person by name — resolves their space automatically. Use when user says 'send X to [person name]'.", inputSchema: { type: "object", properties: { personName: { type: "string" }, text: { type: "string" }, cardsV2: { type: "array" }, threadName: { type: "string" }, messageId: { type: "string" } }, required: ["personName"] } },
   { name: "get_message", description: "Get a single message by its full resource name (e.g. spaces/ABC/messages/XYZ).", inputSchema: { type: "object", properties: { messageName: { type: "string" } }, required: ["messageName"] } },
-  { name: "edit_message", description: "Edit the text of an existing message.", inputSchema: { type: "object", properties: { messageName: { type: "string" }, text: { type: "string" } }, required: ["messageName", "text"] } },
+  { name: "edit_message", description: "Edit the text or cardsV2 content of an existing message.", inputSchema: { type: "object", properties: { messageName: { type: "string" }, text: { type: "string" }, cardsV2: { type: "array" } }, required: ["messageName"] } },
   { name: "delete_message", description: "Delete a message by its full resource name.", inputSchema: { type: "object", properties: { messageName: { type: "string" } }, required: ["messageName"] } },
-  { name: "refresh_cache", description: "Force-refresh the spaces, members, and self-identity caches.", inputSchema: { type: "object", properties: {}, required: [] } },
+  { name: "get_members", description: "List members of a space with role, state, and isSelf flag.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, pageSize: { type: "number" } }, required: ["spaceName"] } },
   { name: "whoami", description: "Return the authenticated caller's identity (email, displayName, userId). Use when unsure which account is authenticated or to debug DM self-filtering.", inputSchema: { type: "object", properties: {}, required: [] } },
-  { name: "get_members", description: "List members of a space with role, state, and isSelf flag. Use to see who's actually in a DM or group space.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, pageSize: { type: "number" } }, required: ["spaceName"] } },
+  { name: "refresh_cache", description: "Force-refresh the spaces, members, and name cache.", inputSchema: { type: "object", properties: {}, required: [] } },
+  { name: "debug_dm_resolution", description: "Diagnostic tool: forces a fresh DM-name resolution pass and returns counters.", inputSchema: { type: "object", properties: {}, required: [] } },
 ];
 
 // ── JSON-RPC handler ──
@@ -683,7 +752,7 @@ async function handleMessage(msg) {
 
   if (method === "initialize") {
     const clientVersion = params?.protocolVersion || "2024-11-05";
-    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.13.0" } } });
+    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.14.0" } } });
     return;
   }
   if (method?.startsWith("notifications/")) return;
@@ -710,6 +779,7 @@ async function handleMessage(msg) {
         case "refresh_cache":   result = await refreshCache(); break;
         case "whoami":          result = await whoami(); break;
         case "get_members":     result = await getMembers(args); break;
+        case "debug_dm_resolution": result = await debugDmResolution(); break;
         default: throw new Error(`Unknown tool: ${toolName}`);
       }
       sendResponse({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] } });
@@ -748,4 +818,4 @@ process.stdin.on("end", () => process.exit(0));
 process.on("SIGTERM", () => process.exit(0));
 process.on("uncaughtException", (e) => log(`Uncaught: ${e.stack}`));
 process.on("unhandledRejection", (e) => log(`Rejection: ${e}`));
-log("server started (v0.13.0 — hardened validation, retry/backoff, whoami, rich send, structured errors)");
+log("server started (v0.14.0 — parity with remote: rich send schemas, debug_dm_resolution, buildNameCache diagnostics)");
