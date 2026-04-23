@@ -85,6 +85,17 @@ async function buildNameCache(chat, cache) {
   const dmSpaces = spaces.filter(
     (s) => (s.spaceType || s.type) === "DIRECT_MESSAGE" && (!s.displayName || s.displayName.startsWith("spaces/")),
   );
+  const diag = {
+    spacesTotal: spaces.length,
+    dmSpacesUnnamed: dmSpaces.length,
+    memberListOk: 0,
+    memberListErr: 0,
+    firstError: null,
+    firstErrorStatus: null,
+    firstSampleMember: null,
+    selfNamesCount: 0,
+    dmLabelsCount: 0,
+  };
   if (dmSpaces.length > 0) {
     const results = await Promise.allSettled(
       dmSpaces.map(async (space) => {
@@ -97,15 +108,34 @@ async function buildNameCache(chat, cache) {
     const freq = {};
     const perSpace = [];
     for (const r of results) {
-      if (r.status !== "fulfilled") continue;
+      if (r.status !== "fulfilled") {
+        diag.memberListErr++;
+        if (!diag.firstError) {
+          diag.firstError = r.reason?.message || String(r.reason);
+          diag.firstErrorStatus = r.reason?.response?.status || r.reason?.code || null;
+        }
+        continue;
+      }
+      diag.memberListOk++;
       const names = [];
       for (const m of r.value.members) {
+        if (!diag.firstSampleMember) {
+          // Sanitise but preserve shape so we can see what fields Google returned.
+          diag.firstSampleMember = {
+            hasMember: !!m.member,
+            memberKeys: m.member ? Object.keys(m.member) : [],
+            displayName: m.member?.displayName || null,
+            memberName: m.member?.name || null,
+            memberType: m.member?.type || null,
+          };
+        }
         const n = m.member?.displayName;
         if (n) { names.push(n); freq[n] = (freq[n] || 0) + 1; }
       }
       perSpace.push({ space: r.value.space, names });
     }
     const selfNames = new Set(Object.entries(freq).filter(([_, c]) => c > 1).map(([n]) => n));
+    diag.selfNamesCount = selfNames.size;
 
     for (const { space, names } of perSpace) {
       const others = names.filter((n) => !selfNames.has(n));
@@ -113,6 +143,9 @@ async function buildNameCache(chat, cache) {
       if (others.length > 0) dmLabels[space.name] = others.join(", ");
     }
   }
+
+  diag.dmLabelsCount = Object.keys(dmLabels).length;
+  console.log("[buildNameCache]", JSON.stringify(diag));
 
   // 2. Then group/named spaces. Full-name keys still set; word-level keys only
   //    if the DM hasn't already claimed them.
@@ -124,6 +157,7 @@ async function buildNameCache(chat, cache) {
 
   cache.nameCache = nc;
   cache.dmLabels = dmLabels;
+  cache.lastDiag = diag;
   return nc;
 }
 
@@ -217,11 +251,23 @@ async function getSpace(chat, cache, { spaceName }) {
       );
       const others = members.filter((n) => !self.has(n));
       const label = (others.length ? others : members).join(", ");
+      console.log("[getSpace]", JSON.stringify({
+        spaceName,
+        membersFound: members.length,
+        others: others.length,
+        hasLabel: !!label,
+      }));
       if (label) {
         cache.dmLabels ||= {};
         cache.dmLabels[spaceName] = label;
       }
-    } catch {}
+    } catch (err) {
+      console.log("[getSpace.err]", JSON.stringify({
+        spaceName,
+        error: err?.message,
+        status: err?.response?.status || err?.code,
+      }));
+    }
   }
   return formatSpace(s, cache);
 }
@@ -238,6 +284,35 @@ async function findDm(chat, cache, { personName }) {
     return { found: false, message: `No DM found for "${personName}"`, availableDMs: available };
   }
   return { found: true, spaceName };
+}
+
+async function debugDmResolution(chat, cache) {
+  // Force a rebuild so we always get fresh numbers.
+  cache.nameCache = null;
+  cache.dmLabels = null;
+  await buildNameCache(chat, cache);
+  const spaces = await ensureSpacesRaw(chat, cache);
+  const dmsUnnamedTotal = spaces.filter(
+    (s) => (s.spaceType || s.type) === "DIRECT_MESSAGE" && (!s.displayName || s.displayName.startsWith("spaces/")),
+  ).length;
+  const sampleLabelled = Object.entries(cache.dmLabels || {}).slice(0, 5);
+  const sampleUnresolvedDms = spaces
+    .filter((s) => {
+      const t = s.spaceType || s.type;
+      if (t !== "DIRECT_MESSAGE") return false;
+      if (s.displayName && !s.displayName.startsWith("spaces/")) return false;
+      return !cache.dmLabels?.[s.name];
+    })
+    .slice(0, 5)
+    .map((s) => s.name);
+  return {
+    diagnostics: cache.lastDiag || null,
+    dmsUnnamedTotal,
+    dmLabelsResolved: Object.keys(cache.dmLabels || {}).length,
+    sampleLabelled: sampleLabelled.map(([spaceName, label]) => ({ spaceName, label })),
+    sampleUnresolvedDms,
+    hint: "If memberListErr > 0 and firstError mentions 'permission'/'403', the chat.memberships.readonly scope was not granted — reconnect the connector on claude.ai.",
+  };
 }
 
 async function sendToPerson(chat, cache, { personName, text, threadName }) {
@@ -262,6 +337,7 @@ export const TOOLS = [
   { name: "get_space", description: "Get details about a space.", inputSchema: { type: "object", properties: { spaceName: { type: "string" } }, required: ["spaceName"] } },
   { name: "find_dm", description: "Find a person's DM space by name or nickname. Use before send_message when you only know a name.", inputSchema: { type: "object", properties: { personName: { type: "string" } }, required: ["personName"] } },
   { name: "send_to_person", description: "Send a DM to a person by name — resolves their space automatically. Use when user says 'send X to [person name]'.", inputSchema: { type: "object", properties: { personName: { type: "string" }, text: { type: "string" }, threadName: { type: "string" } }, required: ["personName", "text"] } },
+  { name: "debug_dm_resolution", description: "Diagnostic tool: forces a fresh DM-name resolution pass and returns counters (spaces found, members.list successes/errors, labels resolved). Use when DM names aren't appearing correctly in list_spaces.", inputSchema: { type: "object", properties: {}, required: [] } },
 ];
 
 const HANDLERS = {
@@ -272,6 +348,7 @@ const HANDLERS = {
   get_space: getSpace,
   find_dm: findDm,
   send_to_person: sendToPerson,
+  debug_dm_resolution: debugDmResolution,
 };
 
 export async function callTool({ name, args, session, googleClientId, googleClientSecret }) {
