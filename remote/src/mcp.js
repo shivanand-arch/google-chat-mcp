@@ -6,7 +6,7 @@ import { TOOLS, callTool } from "./tools.js";
 import { storage } from "./storage.js";
 
 const PROTOCOL_VERSION = "2024-11-05";
-const SERVER_INFO = { name: "google-chat", version: "0.4.0" };
+const SERVER_INFO = { name: "google-chat", version: "0.5.0" };
 
 function jsonRpcError(id, code, message) {
   return { jsonrpc: "2.0", id: id ?? null, error: { code, message } };
