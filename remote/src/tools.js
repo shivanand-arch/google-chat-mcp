@@ -127,13 +127,17 @@ function isSelfMember(member, cache) {
   return false;
 }
 
-const formatMessage = (msg) => ({
-  name: msg.name,
-  text: msg.text || "(no text)",
-  sender: msg.sender?.displayName || msg.sender?.name || "Unknown",
-  createTime: msg.createTime,
-  thread: msg.thread?.name,
-});
+const formatMessage = (msg, senderMap = {}) => {
+  const id = msg.sender?.name;
+  return {
+    name: msg.name,
+    text: msg.text || "(no text)",
+    sender: msg.sender?.displayName || senderMap[id] || id || "Unknown",
+    senderId: id,
+    createTime: msg.createTime,
+    thread: msg.thread?.name,
+  };
+};
 // Format a Google Chat space. Never leaks the raw space ID as displayName —
 // the LLM may render that ID as if it were a person's name in summaries.
 function formatSpace(s, cache) {
@@ -164,6 +168,7 @@ function makeSessionCache() {
     nameCache: null,
     dmLabels: {},
     dmMembers: {},
+    senderMaps: {}, // spaceName → { "users/XXX": "Display Name" }
     selfNames: new Set(),
     selfIdentity: null, // { userId, email, name, source }
   };
@@ -188,6 +193,47 @@ function getOrCreateCache(session) {
     sessionCaches.set(key, cache);
   }
   return cache;
+}
+
+// Resolve users/XXX → "Display Name" for one space. The Chat API does NOT
+// populate sender.displayName on messages.list/get under user auth — only
+// name + type. We call members.list to enrich. Cached per space on the session.
+async function ensureSenderMap(chat, cache, spaceName) {
+  if (!cache.senderMaps) cache.senderMaps = {};
+  if (cache.senderMaps[spaceName]) return cache.senderMaps[spaceName];
+  try {
+    const all = [];
+    let pageToken;
+    do {
+      const res = await withRetry(
+        () => chat.spaces.members.list({ parent: spaceName, pageSize: 1000, pageToken }),
+        { label: `members.list(sender-map:${spaceName})`, maxAttempts: 2 },
+      );
+      if (res.data.memberships) all.push(...res.data.memberships);
+      pageToken = res.data.nextPageToken;
+    } while (pageToken);
+    const map = {};
+    for (const m of all) {
+      const id = m.member?.name;
+      const dn = m.member?.displayName;
+      if (id && dn) map[id] = dn;
+    }
+    cache.senderMaps[spaceName] = map;
+    return map;
+  } catch (err) {
+    // Membership scope missing or space-level permission error — fall back
+    // silently; callers still get the raw user ID.
+    console.log("[senderMap.err]", JSON.stringify({ spaceName, error: err?.message }));
+    cache.senderMaps[spaceName] = {};
+    return {};
+  }
+}
+
+// Derive the parent space from a message resource name like
+// "spaces/AAA/messages/BBB.CCC" → "spaces/AAA".
+function spaceNameFromMessage(messageName) {
+  const m = /^(spaces\/[^/]+)\//.exec(messageName || "");
+  return m ? m[1] : null;
 }
 
 async function ensureSpacesRaw(chat, cache) {
@@ -354,24 +400,26 @@ async function findSpaceByName(chat, cache, personName, { dmOnly = false } = {})
   return null;
 }
 
-async function getMessages(chat, _cache, { spaceName, pageSize = 25, filter = "" }) {
+async function getMessages(chat, cache, { spaceName, pageSize = 25, filter = "" }) {
   validateResourceName(spaceName, "spaceName");
   const params = { parent: spaceName, pageSize, orderBy: "createTime desc" };
   if (filter) params.filter = filter;
-  const res = await withRetry(
-    () => chat.spaces.messages.list(params),
-    { label: "messages.list" },
-  );
-  return (res.data.messages || []).map(formatMessage);
+  const [res, senderMap] = await Promise.all([
+    withRetry(() => chat.spaces.messages.list(params), { label: "messages.list" }),
+    ensureSenderMap(chat, cache, spaceName),
+  ]);
+  return (res.data.messages || []).map((m) => formatMessage(m, senderMap));
 }
 
-async function getMessage(chat, _cache, { messageName }) {
+async function getMessage(chat, cache, { messageName }) {
   validateResourceName(messageName, "messageName");
   const res = await withRetry(
     () => chat.spaces.messages.get({ name: messageName }),
     { label: "messages.get" },
   );
-  return formatMessage(res.data);
+  const spaceName = spaceNameFromMessage(res.data?.name);
+  const senderMap = spaceName ? await ensureSenderMap(chat, cache, spaceName) : {};
+  return formatMessage(res.data, senderMap);
 }
 
 async function editMessage(chat, _cache, { messageName, text, cardsV2 }) {
@@ -434,6 +482,7 @@ async function refreshCache(chat, cache) {
   cache.nameCache = null;
   cache.dmLabels = {};
   cache.dmMembers = {};
+  cache.senderMaps = {};
   cache.selfNames = new Set();
   // keep selfIdentity from OAuth session — it doesn't change per call.
   if (cache.selfIdentity?.name) cache.selfNames.add(cache.selfIdentity.name);
@@ -451,11 +500,14 @@ async function searchMessages(chat, cache, { query, pageSize = 25 }) {
       lower.split(/\s+/).every((w) => w.length > 1 && dn.includes(w));
   });
   if (matching) {
-    const r = await withRetry(
-      () => chat.spaces.messages.list({ parent: matching.name, pageSize, orderBy: "createTime desc" }),
-      { label: "messages.list(matched)" },
-    );
-    return (r.data.messages || []).map((m) => ({ ...formatMessage(m), space: matching.displayName || matching.name }));
+    const [r, senderMap] = await Promise.all([
+      withRetry(
+        () => chat.spaces.messages.list({ parent: matching.name, pageSize, orderBy: "createTime desc" }),
+        { label: "messages.list(matched)" },
+      ),
+      ensureSenderMap(chat, cache, matching.name),
+    ]);
+    return (r.data.messages || []).map((m) => ({ ...formatMessage(m, senderMap), space: matching.displayName || matching.name }));
   }
   const results = [];
   await Promise.allSettled(spaces.map(async (space) => {
@@ -464,9 +516,11 @@ async function searchMessages(chat, cache, { query, pageSize = 25 }) {
         () => chat.spaces.messages.list({ parent: space.name, pageSize: 50, orderBy: "createTime desc" }),
         { label: `messages.list(${space.name})`, maxAttempts: 2 },
       );
-      for (const m of r.data.messages || []) {
-        if (m.text && m.text.toLowerCase().includes(lower))
-          results.push({ ...formatMessage(m), space: space.displayName || space.name });
+      const hits = (r.data.messages || []).filter((m) => m.text && m.text.toLowerCase().includes(lower));
+      if (!hits.length) return;
+      const senderMap = await ensureSenderMap(chat, cache, space.name);
+      for (const m of hits) {
+        results.push({ ...formatMessage(m, senderMap), space: space.displayName || space.name });
       }
     } catch {}
   }));
