@@ -74,6 +74,8 @@ function validateMessageName(name) {
 let allSpacesRaw = null;
 let nameCache = null;
 let dmLabels = {}; // spaceName → "Person A, Person B" (non-self members of each DM)
+let selfNames = new Set(); // names of the authenticated caller — persisted across calls
+let dmMembers = {}; // spaceName → array of raw member displayNames (for get_space responses)
 
 function addToCache(cache, name, spaceName, type, displayName) {
   if (!name) return;
@@ -136,22 +138,29 @@ async function buildNameCache() {
       }
       perSpaceNames.push({ space: r.value.space, names });
     }
-    const selfNames = new Set(Object.entries(nameFreq).filter(([_, c]) => c > 1).map(([n]) => n));
+    const detectedSelf = new Set(Object.entries(nameFreq).filter(([_, c]) => c > 1).map(([n]) => n));
+    for (const n of detectedSelf) selfNames.add(n);
     if (selfNames.size > 0) log(`  Detected self: ${[...selfNames].join(", ")}`);
 
     // Second pass: add only non-self names; also build dmLabels map.
     let hits = 0, emptyDms = 0;
     const labels = {};
+    const members = {};
     for (const { space, names } of perSpaceNames) {
+      members[space.name] = names;
       const others = names.filter(n => !selfNames.has(n));
-      if (others.length === 0) { emptyDms++; continue; }
+      // If self-detection filtered everything out, fall back to all names
+      // so we never leave a DM with no label (which would leak the space ID).
+      const labelNames = others.length ? others : names;
+      if (labelNames.length === 0) { emptyDms++; continue; }
       for (const n of others) {
         addToCache(cache, n, space.name, "DIRECT_MESSAGE", n);
         hits++;
       }
-      labels[space.name] = others.join(", ");
+      labels[space.name] = labelNames.join(", ");
     }
     dmLabels = labels;
+    dmMembers = members;
     log(`  DM resolution: ${hits} names cached, ${errors} API errors, ${emptyDms} DMs with no resolvable member`);
   }
 
@@ -222,9 +231,15 @@ function formatSpace(space) {
   if (!displayName && type === "DIRECT_MESSAGE" && label) {
     displayName = `DM: ${label}`;
   }
-  if (!displayName) displayName = space.name;
+  // Never leak the raw space ID as a displayName — the LLM may render it as a
+  // person's name in summaries. Use a generic placeholder instead.
+  if (!displayName) {
+    displayName = type === "DIRECT_MESSAGE" ? "DM (unresolved)" : "Unnamed space";
+  }
   const out = { name: space.name, displayName, type };
   if (type === "DIRECT_MESSAGE" && label) out.otherMember = label;
+  const members = dmMembers?.[space.name];
+  if (type === "DIRECT_MESSAGE" && members?.length) out.members = members;
   return out;
 }
 
@@ -317,25 +332,25 @@ async function getSpace({ spaceName }) {
   const res = await getChat().spaces.get({ name: spaceName });
   const s = res.data;
   const type = s.spaceType || s.type;
-  // For DMs without a useful displayName, fetch members once to enrich.
-  if (type === "DIRECT_MESSAGE" && (!s.displayName || s.displayName.startsWith("spaces/")) && !dmLabels[spaceName]) {
+  // For DMs, always fetch members and cache them — fixes the bug where
+  // get_space returned only the space ID with no member context.
+  if (type === "DIRECT_MESSAGE" && !dmMembers[spaceName]) {
     try {
       const m = await getChat().spaces.members.list({ parent: spaceName, pageSize: 20 });
       const members = (m.data.memberships || [])
         .map((x) => x.member?.displayName)
         .filter(Boolean);
-      // If we already know self from buildNameCache, filter them out.
-      const self = new Set(
-        nameCache
-          ? Object.values(nameCache)
-              .filter((v) => v.type === "DIRECT_MESSAGE")
-              .map((v) => v.displayName)
-          : []
-      );
-      const others = members.filter((n) => !self.has(n));
-      const label = (others.length ? others : members).join(", ");
-      if (label) dmLabels[spaceName] = label;
-    } catch {}
+      dmMembers[spaceName] = members;
+      // Use the persistent selfNames from buildNameCache to identify "self".
+      // If self-detection hasn't run yet, fall back to showing all members.
+      const others = selfNames.size > 0
+        ? members.filter((n) => !selfNames.has(n))
+        : members;
+      const labelNames = others.length ? others : members;
+      if (labelNames.length) dmLabels[spaceName] = labelNames.join(", ");
+    } catch (e) {
+      log(`get_space members fetch failed for ${spaceName}: ${e.message}`);
+    }
   }
   return formatSpace(s);
 }
@@ -394,6 +409,8 @@ async function refreshCache() {
   allSpacesRaw = null;
   nameCache = null;
   dmLabels = {};
+  dmMembers = {};
+  selfNames = new Set();
   await buildNameCache();
   return { refreshed: true, spaces: allSpacesRaw.length };
 }
@@ -420,7 +437,7 @@ async function handleMessage(msg) {
 
   if (method === "initialize") {
     const clientVersion = params?.protocolVersion || "2024-11-05";
-    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.11.0" } } });
+    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.12.0" } } });
     return;
   }
   if (method?.startsWith("notifications/")) return;
@@ -480,4 +497,4 @@ process.stdin.on("end", () => process.exit(0));
 process.on("SIGTERM", () => process.exit(0));
 process.on("uncaughtException", (e) => log(`Uncaught: ${e.stack}`));
 process.on("unhandledRejection", (e) => log(`Rejection: ${e}`));
-log("server started (v0.11.0 — DM labels flow into list_spaces & get_space output)");
+log("server started (v0.12.0 — DM labels flow into list_spaces & get_space output)");
