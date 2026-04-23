@@ -42,6 +42,91 @@ function makeChatClient({ google: g, googleClientId, googleClientSecret }) {
   return google.chat({ version: "v1", auth: oauth2 });
 }
 
+// ── Input validation (ported from googleworkspace/cli validate.rs) ──
+function isDangerousUnicode(code) {
+  return (code >= 0x200B && code <= 0x200D) ||
+    code === 0xFEFF ||
+    (code >= 0x202A && code <= 0x202E) ||
+    (code >= 0x2028 && code <= 0x2029) ||
+    (code >= 0x2066 && code <= 0x2069);
+}
+function validateResourceName(s, label = "name") {
+  if (!s || typeof s !== "string") throw new Error(`${label} must be a non-empty string`);
+  if (s.split("/").some(seg => seg === ".."))
+    throw new Error(`${label} must not contain path traversal ('..'): "${s}"`);
+  if (s.includes("?") || s.includes("#"))
+    throw new Error(`${label} must not contain '?' or '#': "${s}"`);
+  if (s.includes("%"))
+    throw new Error(`${label} must not contain '%' (URL-encoding bypass): "${s}"`);
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    if (code === 0 || code < 0x20 || (code >= 0x7F && code <= 0x9F))
+      throw new Error(`${label} must not contain control chars: "${s}"`);
+    if (isDangerousUnicode(code))
+      throw new Error(`${label} must not contain invisible/bidi Unicode: "${s}"`);
+  }
+  return s;
+}
+
+// ── Retry with exponential backoff + jitter on 429/5xx ──
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function withRetry(fn, { label = "api-call", maxAttempts = 4 } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try { return await fn(); } catch (err) {
+      lastErr = err;
+      const code = err?.code || err?.response?.status;
+      const retryable = code === 429 || (code >= 500 && code < 600);
+      if (!retryable || attempt === maxAttempts) break;
+      const retryAfterHdr = err?.response?.headers?.["retry-after"];
+      const retryAfterMs = retryAfterHdr && !isNaN(+retryAfterHdr) ? +retryAfterHdr * 1000 : 0;
+      const backoff = Math.min(30000, 500 * Math.pow(2, attempt - 1));
+      const delay = Math.max(retryAfterMs, backoff) + Math.random() * 250;
+      console.log(`[retry] ${label} ${code} attempt ${attempt}/${maxAttempts} waiting ${Math.round(delay)}ms`);
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
+
+// ── Structured error normalization ──
+function normalizeApiError(err) {
+  const data = err?.response?.data;
+  if (!data) return { message: err.message || String(err) };
+  const inner = data.error || data;
+  const out = {
+    code: inner.code ?? err.code,
+    status: inner.status,
+    message: inner.message || err.message,
+    reason: inner.errors?.[0]?.reason || inner.reason,
+  };
+  if (out.reason === "accessNotConfigured" && typeof out.message === "string") {
+    const m = out.message.match(/visiting\s+(https?:\/\/\S+?)[.,;:)\]"']?(?:\s|$)/);
+    if (m) out.enableUrl = m[1];
+  }
+  return out;
+}
+function formatApiError(err) {
+  const n = normalizeApiError(err);
+  const parts = [];
+  if (n.code) parts.push(`[${n.code}${n.status ? " " + n.status : ""}]`);
+  if (n.reason) parts.push(`(${n.reason})`);
+  parts.push(n.message || "Unknown error");
+  if (n.enableUrl) parts.push(`→ Enable it at: ${n.enableUrl}`);
+  return parts.join(" ");
+}
+
+// Authoritative self check via OAuth session identity.
+function isSelfMember(member, cache) {
+  const id = cache?.selfIdentity;
+  if (!id) return false;
+  const dn = member?.member?.displayName || member?.displayName || "";
+  const uid = member?.member?.name || "";
+  if (id.name && dn && dn === id.name) return true;
+  if (id.userId && uid === `users/${id.userId}`) return true;
+  return false;
+}
+
 const formatMessage = (msg) => ({
   name: msg.name,
   text: msg.text || "(no text)",
@@ -49,9 +134,8 @@ const formatMessage = (msg) => ({
   createTime: msg.createTime,
   thread: msg.thread?.name,
 });
-// Format a raw Google Chat space into our output shape. For DMs whose Google-
-// side displayName is empty or just the space id, substitute the resolved
-// counterparty name from the session's dmLabels map if available.
+// Format a Google Chat space. Never leaks the raw space ID as displayName —
+// the LLM may render that ID as if it were a person's name in summaries.
 function formatSpace(s, cache) {
   const type = s.spaceType || s.type;
   const raw = s.displayName || "";
@@ -60,15 +144,26 @@ function formatSpace(s, cache) {
   if (!displayName && type === "DIRECT_MESSAGE" && label) {
     displayName = `DM: ${label}`;
   }
-  if (!displayName) displayName = s.name;
+  if (!displayName) {
+    displayName = type === "DIRECT_MESSAGE" ? "DM (unresolved)" : "Unnamed space";
+  }
   const out = { name: s.name, displayName, type };
   if (type === "DIRECT_MESSAGE" && label) out.otherMember = label;
+  const members = cache?.dmMembers?.[s.name];
+  if (type === "DIRECT_MESSAGE" && members?.length) out.members = members;
   return out;
 }
 
-// Simple per-session cache so repeated tool calls don't re-list spaces.
+// Per-session cache so repeated tool calls don't re-list spaces.
 function makeSessionCache() {
-  return { spaces: null, nameCache: null, dmLabels: null };
+  return {
+    spaces: null,
+    nameCache: null,
+    dmLabels: {},
+    dmMembers: {},
+    selfNames: new Set(),
+    selfIdentity: null, // { userId, email, name, source }
+  };
 }
 
 async function ensureSpacesRaw(chat, cache) {
@@ -76,7 +171,10 @@ async function ensureSpacesRaw(chat, cache) {
     const all = [];
     let pageToken;
     do {
-      const res = await chat.spaces.list({ pageSize: 1000, pageToken });
+      const res = await withRetry(
+        () => chat.spaces.list({ pageSize: 1000, pageToken }),
+        { label: "spaces.list" },
+      );
       if (res.data.spaces) all.push(...res.data.spaces);
       pageToken = res.data.nextPageToken;
     } while (pageToken);
@@ -127,14 +225,19 @@ async function buildNameCache(chat, cache) {
   if (dmSpaces.length > 0) {
     const results = await Promise.allSettled(
       dmSpaces.map(async (space) => {
-        const r = await chat.spaces.members.list({ parent: space.name, pageSize: 20 });
+        const r = await withRetry(
+          () => chat.spaces.members.list({ parent: space.name, pageSize: 20 }),
+          { label: `members.list(${space.name})` },
+        );
         return { space, members: r.data.memberships || [] };
       }),
     );
 
-    // Count name frequency: caller appears in every DM, so frequency > 1 => self.
+    // Primary signal: userId match via selfIdentity (authoritative, from OAuth session).
+    // Fallback: frequency — the caller appears in every DM.
     const freq = {};
     const perSpace = [];
+    const allMembersPerSpace = {};
     for (const r of results) {
       if (r.status !== "fulfilled") {
         diag.memberListErr++;
@@ -146,9 +249,9 @@ async function buildNameCache(chat, cache) {
       }
       diag.memberListOk++;
       const names = [];
+      const allNames = [];
       for (const m of r.value.members) {
         if (!diag.firstSampleMember) {
-          // Sanitise but preserve shape so we can see what fields Google returned.
           diag.firstSampleMember = {
             hasMember: !!m.member,
             memberKeys: m.member ? Object.keys(m.member) : [],
@@ -158,17 +261,30 @@ async function buildNameCache(chat, cache) {
           };
         }
         const n = m.member?.displayName;
-        if (n) { names.push(n); freq[n] = (freq[n] || 0) + 1; }
+        if (!n) continue;
+        allNames.push(n);
+        if (isSelfMember(m, cache)) { cache.selfNames.add(n); continue; }
+        names.push(n);
+        freq[n] = (freq[n] || 0) + 1;
       }
+      allMembersPerSpace[r.value.space.name] = allNames;
       perSpace.push({ space: r.value.space, names });
     }
-    const selfNames = new Set(Object.entries(freq).filter(([_, c]) => c > 1).map(([n]) => n));
-    diag.selfNamesCount = selfNames.size;
+    // Fallback heuristic only if authoritative identity hasn't resolved self.
+    if (cache.selfNames.size === 0) {
+      const detected = Object.entries(freq).filter(([, c]) => c > 1).map(([n]) => n);
+      for (const n of detected) cache.selfNames.add(n);
+    }
+    diag.selfNamesCount = cache.selfNames.size;
+    diag.selfSource = cache.selfIdentity?.source || "frequency";
 
     for (const { space, names } of perSpace) {
-      const others = names.filter((n) => !selfNames.has(n));
+      const others = names.filter((n) => !cache.selfNames.has(n));
+      const allNames = allMembersPerSpace[space.name] || [];
+      const labelNames = others.length ? others : allNames;
       for (const n of others) addToCache(nc, n, space.name, "DIRECT_MESSAGE", n);
-      if (others.length > 0) dmLabels[space.name] = others.join(", ");
+      if (labelNames.length) dmLabels[space.name] = labelNames.join(", ");
+      cache.dmMembers[space.name] = allNames;
     }
   }
 
@@ -215,10 +331,90 @@ async function findSpaceByName(chat, cache, personName, { dmOnly = false } = {})
 }
 
 async function getMessages(chat, _cache, { spaceName, pageSize = 25, filter = "" }) {
+  validateResourceName(spaceName, "spaceName");
   const params = { parent: spaceName, pageSize, orderBy: "createTime desc" };
   if (filter) params.filter = filter;
-  const res = await chat.spaces.messages.list(params);
+  const res = await withRetry(
+    () => chat.spaces.messages.list(params),
+    { label: "messages.list" },
+  );
   return (res.data.messages || []).map(formatMessage);
+}
+
+async function getMessage(chat, _cache, { messageName }) {
+  validateResourceName(messageName, "messageName");
+  const res = await withRetry(
+    () => chat.spaces.messages.get({ name: messageName }),
+    { label: "messages.get" },
+  );
+  return formatMessage(res.data);
+}
+
+async function editMessage(chat, _cache, { messageName, text, cardsV2 }) {
+  validateResourceName(messageName, "messageName");
+  const body = {};
+  const mask = [];
+  if (text !== undefined) { body.text = text; mask.push("text"); }
+  if (cardsV2 !== undefined) { body.cardsV2 = cardsV2; mask.push("cards_v2"); }
+  if (mask.length === 0) throw new Error("edit_message requires text or cardsV2");
+  const res = await withRetry(
+    () => chat.spaces.messages.patch({
+      name: messageName,
+      updateMask: mask.join(","),
+      requestBody: body,
+    }),
+    { label: "messages.patch" },
+  );
+  return formatMessage(res.data);
+}
+
+async function deleteMessage(chat, _cache, { messageName }) {
+  validateResourceName(messageName, "messageName");
+  await withRetry(
+    () => chat.spaces.messages.delete({ name: messageName }),
+    { label: "messages.delete" },
+  );
+  return { deleted: true, messageName };
+}
+
+async function getMembers(chat, cache, { spaceName, pageSize = 50 }) {
+  validateResourceName(spaceName, "spaceName");
+  const res = await withRetry(
+    () => chat.spaces.members.list({ parent: spaceName, pageSize }),
+    { label: "members.list" },
+  );
+  return (res.data.memberships || []).map((m) => ({
+    name: m.name,
+    state: m.state,
+    role: m.role,
+    memberName: m.member?.name,
+    displayName: m.member?.displayName,
+    type: m.member?.type,
+    isSelf: isSelfMember(m, cache),
+  }));
+}
+
+async function whoami(_chat, cache) {
+  if (cache.selfIdentity) return cache.selfIdentity;
+  return {
+    source: cache.selfNames.size > 0 ? "frequency" : "unknown",
+    inferredNames: [...cache.selfNames],
+    hint: cache.selfNames.size === 0
+      ? "OAuth session is missing user info — reconnect the connector on claude.ai."
+      : undefined,
+  };
+}
+
+async function refreshCache(chat, cache) {
+  cache.spaces = null;
+  cache.nameCache = null;
+  cache.dmLabels = {};
+  cache.dmMembers = {};
+  cache.selfNames = new Set();
+  // keep selfIdentity from OAuth session — it doesn't change per call.
+  if (cache.selfIdentity?.name) cache.selfNames.add(cache.selfIdentity.name);
+  await buildNameCache(chat, cache);
+  return { refreshed: true, spaces: cache.spaces.length, self: cache.selfIdentity };
 }
 
 async function searchMessages(chat, cache, { query, pageSize = 25 }) {
@@ -231,13 +427,19 @@ async function searchMessages(chat, cache, { query, pageSize = 25 }) {
       lower.split(/\s+/).every((w) => w.length > 1 && dn.includes(w));
   });
   if (matching) {
-    const r = await chat.spaces.messages.list({ parent: matching.name, pageSize, orderBy: "createTime desc" });
+    const r = await withRetry(
+      () => chat.spaces.messages.list({ parent: matching.name, pageSize, orderBy: "createTime desc" }),
+      { label: "messages.list(matched)" },
+    );
     return (r.data.messages || []).map((m) => ({ ...formatMessage(m), space: matching.displayName || matching.name }));
   }
   const results = [];
   await Promise.allSettled(spaces.map(async (space) => {
     try {
-      const r = await chat.spaces.messages.list({ parent: space.name, pageSize: 50, orderBy: "createTime desc" });
+      const r = await withRetry(
+        () => chat.spaces.messages.list({ parent: space.name, pageSize: 50, orderBy: "createTime desc" }),
+        { label: `messages.list(${space.name})`, maxAttempts: 2 },
+      );
       for (const m of r.data.messages || []) {
         if (m.text && m.text.toLowerCase().includes(lower))
           results.push({ ...formatMessage(m), space: space.displayName || space.name });
@@ -248,77 +450,99 @@ async function searchMessages(chat, cache, { query, pageSize = 25 }) {
   return results.slice(0, pageSize);
 }
 
-async function sendMessage(chat, _cache, { spaceName, text, threadName }) {
-  const body = { text };
+async function sendMessage(chat, _cache, {
+  spaceName, text, cardsV2, threadName, threadKey, replyOption, messageId, privateToUserId,
+}) {
+  validateResourceName(spaceName, "spaceName");
+  if (!text && !cardsV2) throw new Error("send_message requires text or cardsV2");
+  if (messageId) validateResourceName(messageId, "messageId");
+  if (threadName) validateResourceName(threadName, "threadName");
+
+  const body = {};
+  if (text) body.text = text;
+  if (cardsV2) body.cardsV2 = cardsV2;
   if (threadName) body.thread = { name: threadName };
-  const res = await chat.spaces.messages.create({
-    parent: spaceName, requestBody: body,
-    messageReplyOption: threadName ? "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" : undefined,
-  });
+  else if (threadKey) body.thread = { threadKey };
+  if (privateToUserId) body.privateMessageViewer = { name: `users/${privateToUserId}` };
+
+  const params = { parent: spaceName, requestBody: body };
+  if (messageId) params.messageId = messageId;
+  if (replyOption) params.messageReplyOption = replyOption;
+  else if (threadName || threadKey) params.messageReplyOption = "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD";
+
+  const res = await withRetry(
+    () => chat.spaces.messages.create(params),
+    { label: "messages.create" },
+  );
   return formatMessage(res.data);
 }
 
 async function getSpace(chat, cache, { spaceName }) {
-  const res = await chat.spaces.get({ name: spaceName });
+  validateResourceName(spaceName, "spaceName");
+  const res = await withRetry(
+    () => chat.spaces.get({ name: spaceName }),
+    { label: "spaces.get" },
+  );
   const s = res.data;
   const type = s.spaceType || s.type;
-  // For DMs without a useful displayName, fetch members once to enrich.
-  if (type === "DIRECT_MESSAGE" && (!s.displayName || s.displayName.startsWith("spaces/")) && !cache.dmLabels?.[spaceName]) {
+  if (type === "DIRECT_MESSAGE" && !cache.dmMembers[spaceName]) {
     try {
-      const m = await chat.spaces.members.list({ parent: spaceName, pageSize: 20 });
-      const members = (m.data.memberships || [])
+      const m = await withRetry(
+        () => chat.spaces.members.list({ parent: spaceName, pageSize: 20 }),
+        { label: "members.list(get_space)" },
+      );
+      const memberships = m.data.memberships || [];
+      const allNames = memberships.map((x) => x.member?.displayName).filter(Boolean);
+      // Authoritative self check via OAuth session identity; fall back to cached selfNames.
+      const otherNames = memberships
+        .filter((x) => !isSelfMember(x, cache) && !cache.selfNames.has(x.member?.displayName))
         .map((x) => x.member?.displayName)
         .filter(Boolean);
-      // If we already know self from an earlier buildNameCache pass, filter them out.
-      const self = new Set(
-        cache.nameCache
-          ? Object.values(cache.nameCache)
-              .filter((v) => v.type === "DIRECT_MESSAGE")
-              .map((v) => v.displayName)
-          : []
-      );
-      const others = members.filter((n) => !self.has(n));
-      const label = (others.length ? others : members).join(", ");
-      console.log("[getSpace]", JSON.stringify({
-        spaceName,
-        membersFound: members.length,
-        others: others.length,
-        hasLabel: !!label,
-      }));
-      if (label) {
-        cache.dmLabels ||= {};
-        cache.dmLabels[spaceName] = label;
-      }
+      cache.dmMembers[spaceName] = allNames;
+      const labelNames = otherNames.length ? otherNames : allNames;
+      if (labelNames.length) cache.dmLabels[spaceName] = labelNames.join(", ");
     } catch (err) {
       console.log("[getSpace.err]", JSON.stringify({
         spaceName,
-        error: err?.message,
-        status: err?.response?.status || err?.code,
+        error: formatApiError(err),
       }));
     }
   }
   return formatSpace(s, cache);
 }
 
-async function findDm(chat, cache, { personName }) {
-  const spaceName = await findSpaceByName(chat, cache, personName, { dmOnly: true });
-  if (spaceName) return { found: true, spaceName };
+async function resolvePersonToDm(chat, cache, personName) {
+  const cached = await findSpaceByName(chat, cache, personName, { dmOnly: true });
+  if (cached) return { spaceName: cached, resolvedVia: "cache" };
 
-  // Fallback: look up email from employee directory → call findDirectMessage
   const email = lookupEmailFromDirectory(personName);
   if (email) {
     try {
-      const res = await chat.spaces.findDirectMessage({ name: `users/${email}` });
+      validateResourceName(email, "email");
+      const res = await withRetry(
+        () => chat.spaces.findDirectMessage({ name: `users/${email}` }),
+        { label: "findDirectMessage", maxAttempts: 2 },
+      );
       if (res.data?.name) {
-        return { found: true, spaceName: res.data.name, resolvedVia: "directory", email };
+        return { spaceName: res.data.name, resolvedVia: "findDirectMessage", email };
       }
-    } catch {}
+    } catch (err) {
+      console.log("[findDirectMessage.err]", JSON.stringify({
+        email, error: formatApiError(err),
+      }));
+    }
   }
+  return null;
+}
+
+async function findDm(chat, cache, { personName }) {
+  const resolved = await resolvePersonToDm(chat, cache, personName);
+  if (resolved) return { found: true, ...resolved };
 
   if (!cache.nameCache) await buildNameCache(chat, cache);
   const available = Object.entries(cache.nameCache)
     .filter(([k, v]) => k.length > 2 && v.type === "DIRECT_MESSAGE")
-    .map(([_, v]) => v.displayName)
+    .map(([, v]) => v.displayName)
     .filter((v, i, a) => a.indexOf(v) === i)
     .slice(0, 50);
   return { found: false, message: `No DM found for "${personName}"`, availableDMs: available };
@@ -353,21 +577,9 @@ async function debugDmResolution(chat, cache) {
   };
 }
 
-async function sendToPerson(chat, cache, { personName, text, threadName }) {
-  let spaceName = await findSpaceByName(chat, cache, personName, { dmOnly: true });
-
-  if (!spaceName) {
-    // Fallback: look up email from employee directory → call findDirectMessage
-    const email = lookupEmailFromDirectory(personName);
-    if (email) {
-      try {
-        const res = await chat.spaces.findDirectMessage({ name: `users/${email}` });
-        if (res.data?.name) spaceName = res.data.name;
-      } catch {}
-    }
-  }
-
-  if (!spaceName) {
+async function sendToPerson(chat, cache, { personName, text, threadName, cardsV2, messageId }) {
+  const resolved = await resolvePersonToDm(chat, cache, personName);
+  if (!resolved) {
     if (!cache.nameCache) await buildNameCache(chat, cache);
     const names = Object.entries(cache.nameCache)
       .filter(([k, v]) => k.length > 2 && v.type === "DIRECT_MESSAGE")
@@ -376,18 +588,27 @@ async function sendToPerson(chat, cache, { personName, text, threadName }) {
       .join(", ");
     throw new Error(`No DM found for "${personName}". Available DMs: ${names}`);
   }
-  return await sendMessage(chat, cache, { spaceName, text, threadName });
+  const sent = await sendMessage(chat, cache, {
+    spaceName: resolved.spaceName, text, threadName, cardsV2, messageId,
+  });
+  return { ...sent, resolvedVia: resolved.resolvedVia, email: resolved.email };
 }
 
 export const TOOLS = [
   { name: "list_spaces", description: "List all Google Chat spaces and DMs.", inputSchema: { type: "object", properties: {}, required: [] } },
   { name: "get_messages", description: "Get recent messages from a space.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, pageSize: { type: "number" }, filter: { type: "string" } }, required: ["spaceName"] } },
   { name: "search_messages", description: "Search messages across ALL spaces in parallel. If the query matches a space/group name, returns messages from that space. Otherwise searches message text across all spaces.", inputSchema: { type: "object", properties: { query: { type: "string" }, pageSize: { type: "number" } }, required: ["query"] } },
-  { name: "send_message", description: "Send a message to a space by space name.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, text: { type: "string" }, threadName: { type: "string" } }, required: ["spaceName", "text"] } },
-  { name: "get_space", description: "Get details about a space.", inputSchema: { type: "object", properties: { spaceName: { type: "string" } }, required: ["spaceName"] } },
+  { name: "send_message", description: "Send a message to a space. Supports plain text, cardsV2, threaded replies (threadName/threadKey), messageId (idempotency), and privateMessageViewer.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, text: { type: "string" }, cardsV2: { type: "array" }, threadName: { type: "string" }, threadKey: { type: "string" }, replyOption: { type: "string" }, messageId: { type: "string" }, privateToUserId: { type: "string" } }, required: ["spaceName"] } },
+  { name: "get_space", description: "Get details about a space including members (for DMs).", inputSchema: { type: "object", properties: { spaceName: { type: "string" } }, required: ["spaceName"] } },
   { name: "find_dm", description: "Find a person's DM space by name or nickname. Use before send_message when you only know a name.", inputSchema: { type: "object", properties: { personName: { type: "string" } }, required: ["personName"] } },
-  { name: "send_to_person", description: "Send a DM to a person by name — resolves their space automatically. Use when user says 'send X to [person name]'.", inputSchema: { type: "object", properties: { personName: { type: "string" }, text: { type: "string" }, threadName: { type: "string" } }, required: ["personName", "text"] } },
-  { name: "debug_dm_resolution", description: "Diagnostic tool: forces a fresh DM-name resolution pass and returns counters (spaces found, members.list successes/errors, labels resolved). Use when DM names aren't appearing correctly in list_spaces.", inputSchema: { type: "object", properties: {}, required: [] } },
+  { name: "send_to_person", description: "Send a DM to a person by name — resolves their space automatically. Use when user says 'send X to [person name]'.", inputSchema: { type: "object", properties: { personName: { type: "string" }, text: { type: "string" }, cardsV2: { type: "array" }, threadName: { type: "string" }, messageId: { type: "string" } }, required: ["personName"] } },
+  { name: "get_message", description: "Get a single message by its full resource name.", inputSchema: { type: "object", properties: { messageName: { type: "string" } }, required: ["messageName"] } },
+  { name: "edit_message", description: "Edit the text or cardsV2 content of an existing message.", inputSchema: { type: "object", properties: { messageName: { type: "string" }, text: { type: "string" }, cardsV2: { type: "array" } }, required: ["messageName"] } },
+  { name: "delete_message", description: "Delete a message by its full resource name.", inputSchema: { type: "object", properties: { messageName: { type: "string" } }, required: ["messageName"] } },
+  { name: "get_members", description: "List members of a space with role, state, and isSelf flag.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, pageSize: { type: "number" } }, required: ["spaceName"] } },
+  { name: "whoami", description: "Return the authenticated caller's identity from the OAuth session.", inputSchema: { type: "object", properties: {}, required: [] } },
+  { name: "refresh_cache", description: "Force-refresh the spaces, members, and name cache for this session.", inputSchema: { type: "object", properties: {}, required: [] } },
+  { name: "debug_dm_resolution", description: "Diagnostic tool: forces a fresh DM-name resolution pass and returns counters.", inputSchema: { type: "object", properties: {}, required: [] } },
 ];
 
 const HANDLERS = {
@@ -398,6 +619,12 @@ const HANDLERS = {
   get_space: getSpace,
   find_dm: findDm,
   send_to_person: sendToPerson,
+  get_message: getMessage,
+  edit_message: editMessage,
+  delete_message: deleteMessage,
+  get_members: getMembers,
+  whoami: whoami,
+  refresh_cache: refreshCache,
   debug_dm_resolution: debugDmResolution,
 };
 
@@ -406,5 +633,23 @@ export async function callTool({ name, args, session, googleClientId, googleClie
   if (!handler) throw new Error(`Unknown tool: ${name}`);
   const chat = makeChatClient({ google: session.google, googleClientId, googleClientSecret });
   session.cache ||= makeSessionCache();
-  return await handler(chat, session.cache, args || {});
+  // Seed authoritative self identity from the OAuth session exactly once.
+  // No userinfo API call needed — oauth.js already captured this during login.
+  if (!session.cache.selfIdentity && session.user) {
+    session.cache.selfIdentity = {
+      userId: session.user.sub,
+      email: session.user.email,
+      name: session.user.name,
+      source: "oauth-session",
+    };
+    if (session.user.name) session.cache.selfNames.add(session.user.name);
+  }
+  try {
+    return await handler(chat, session.cache, args || {});
+  } catch (err) {
+    if (err?.response?.data) {
+      throw new Error(formatApiError(err));
+    }
+    throw err;
+  }
 }
