@@ -198,35 +198,41 @@ function getOrCreateCache(session) {
 // Resolve users/XXX → "Display Name" for one space. The Chat API does NOT
 // populate sender.displayName on messages.list/get under user auth — only
 // name + type. We call members.list to enrich. Cached per space on the session.
+// Chat API omits sender.displayName under user-auth. USER_MENTION annotations
+// on messages carry the mentioned user's ID + text position — anyone @mentioned
+// in the space becomes resolvable for free, no extra scope needed.
+function harvestAnnotations(messages, map) {
+  for (const m of messages || []) {
+    if (!m.annotations || !m.text) continue;
+    for (const a of m.annotations) {
+      if (a.type !== "USER_MENTION") continue;
+      const id = a.userMention?.user?.name;
+      if (!id) continue;
+      const si = Number(a.startIndex) || 0;
+      const len = Number(a.length) || 0;
+      if (len <= 1) continue;
+      const mention = m.text.substring(si, si + len);
+      const name = mention.startsWith("@") ? mention.slice(1).trim() : mention.trim();
+      if (name && !map[id]) map[id] = name;
+    }
+  }
+}
+
 async function ensureSenderMap(chat, cache, spaceName) {
   if (!cache.senderMaps) cache.senderMaps = {};
   if (cache.senderMaps[spaceName]) return cache.senderMaps[spaceName];
+  const map = {};
   try {
-    const all = [];
-    let pageToken;
-    do {
-      const res = await withRetry(
-        () => chat.spaces.members.list({ parent: spaceName, pageSize: 1000, pageToken }),
-        { label: `members.list(sender-map:${spaceName})`, maxAttempts: 2 },
-      );
-      if (res.data.memberships) all.push(...res.data.memberships);
-      pageToken = res.data.nextPageToken;
-    } while (pageToken);
-    const map = {};
-    for (const m of all) {
-      const id = m.member?.name;
-      const dn = m.member?.displayName;
-      if (id && dn) map[id] = dn;
-    }
-    cache.senderMaps[spaceName] = map;
-    return map;
+    const res = await withRetry(
+      () => chat.spaces.messages.list({ parent: spaceName, pageSize: 200, orderBy: "createTime desc" }),
+      { label: `messages.list(sender-warmup:${spaceName})`, maxAttempts: 2 },
+    );
+    harvestAnnotations(res.data.messages || [], map);
   } catch (err) {
-    // Membership scope missing or space-level permission error — fall back
-    // silently; callers still get the raw user ID.
     console.log("[senderMap.err]", JSON.stringify({ spaceName, error: err?.message }));
-    cache.senderMaps[spaceName] = {};
-    return {};
   }
+  cache.senderMaps[spaceName] = map;
+  return map;
 }
 
 // Derive the parent space from a message resource name like
@@ -408,7 +414,9 @@ async function getMessages(chat, cache, { spaceName, pageSize = 25, filter = "" 
     withRetry(() => chat.spaces.messages.list(params), { label: "messages.list" }),
     ensureSenderMap(chat, cache, spaceName),
   ]);
-  return (res.data.messages || []).map((m) => formatMessage(m, senderMap));
+  const messages = res.data.messages || [];
+  harvestAnnotations(messages, senderMap);
+  return messages.map((m) => formatMessage(m, senderMap));
 }
 
 async function getMessage(chat, cache, { messageName }) {

@@ -225,7 +225,49 @@ let nameCache = null;
 let dmLabels = {}; // spaceName → "Person A, Person B" (non-self members of each DM)
 let selfNames = new Set(); // display names of self — seeded from selfIdentity when available
 let dmMembers = {}; // spaceName → array of raw member displayNames (for get_space responses)
+let senderMaps = {}; // spaceName → { "users/XXX": "Display Name" } for sender-name enrichment
 let lastDiag = null; // diagnostics from last buildNameCache run, exposed via debug_dm_resolution
+
+// Chat API omits sender.displayName under user-auth. But USER_MENTION
+// annotations on messages carry the mentioned user's ID + the text position,
+// so anyone @mentioned in the space becomes resolvable for free.
+function harvestAnnotations(messages, map) {
+  for (const m of messages || []) {
+    if (!m.annotations || !m.text) continue;
+    for (const a of m.annotations) {
+      if (a.type !== "USER_MENTION") continue;
+      const id = a.userMention?.user?.name;
+      if (!id) continue;
+      const si = Number(a.startIndex) || 0;
+      const len = Number(a.length) || 0;
+      if (len <= 1) continue;
+      const mention = m.text.substring(si, si + len);
+      const name = mention.startsWith("@") ? mention.slice(1).trim() : mention.trim();
+      if (name && !map[id]) map[id] = name;
+    }
+  }
+}
+
+async function ensureSenderMap(spaceName) {
+  if (senderMaps[spaceName]) return senderMaps[spaceName];
+  const map = {};
+  try {
+    const res = await withRetry(
+      () => getChat().spaces.messages.list({ parent: spaceName, pageSize: 200, orderBy: "createTime desc" }),
+      { label: `messages.list(sender-warmup:${spaceName})`, maxAttempts: 2 },
+    );
+    harvestAnnotations(res.data.messages || [], map);
+  } catch (err) {
+    log(`[senderMap.err] ${spaceName}: ${err?.message}`);
+  }
+  senderMaps[spaceName] = map;
+  return map;
+}
+
+function spaceNameFromMessage(messageName) {
+  const m = /^(spaces\/[^/]+)\//.exec(messageName || "");
+  return m ? m[1] : null;
+}
 
 function addToCache(cache, name, spaceName, type, displayName) {
   if (!name) return;
@@ -414,11 +456,13 @@ async function findSpaceByName(personName, { dmOnly = false } = {}) {
 }
 
 // ── Helpers ──
-function formatMessage(msg) {
+function formatMessage(msg, senderMap = {}) {
+  const id = msg.sender?.name;
   return {
     name: msg.name,
     text: msg.text || "(no text)",
-    sender: msg.sender?.displayName || msg.sender?.name || "Unknown",
+    sender: msg.sender?.displayName || senderMap[id] || id || "Unknown",
+    senderId: id,
     createTime: msg.createTime,
     thread: msg.thread?.name,
   };
@@ -455,8 +499,13 @@ async function getMessages({ spaceName, pageSize = 25, filter = "" }) {
   validateSpaceName(spaceName);
   const params = { parent: spaceName, pageSize, orderBy: "createTime desc" };
   if (filter) params.filter = filter;
-  const res = await withRetry(() => getChat().spaces.messages.list(params), { label: "messages.list" });
-  return (res.data.messages || []).map(formatMessage);
+  const [res, senderMap] = await Promise.all([
+    withRetry(() => getChat().spaces.messages.list(params), { label: "messages.list" }),
+    ensureSenderMap(spaceName),
+  ]);
+  const messages = res.data.messages || [];
+  harvestAnnotations(messages, senderMap);
+  return messages.map((m) => formatMessage(m, senderMap));
 }
 
 async function getMessage({ messageName }) {
@@ -465,7 +514,9 @@ async function getMessage({ messageName }) {
     () => getChat().spaces.messages.get({ name: messageName }),
     { label: "messages.get" },
   );
-  return formatMessage(res.data);
+  const spaceName = spaceNameFromMessage(res.data?.name);
+  const senderMap = spaceName ? await ensureSenderMap(spaceName) : {};
+  return formatMessage(res.data, senderMap);
 }
 
 async function editMessage({ messageName, text, cardsV2 }) {
@@ -508,14 +559,17 @@ async function searchMessages({ query, pageSize = 25 }) {
 
   if (matchingSpace) {
     log(`  search matched space: ${matchingSpace.displayName} (${matchingSpace.name})`);
-    const msgsRes = await withRetry(
-      () => getChat().spaces.messages.list({
-        parent: matchingSpace.name, pageSize, orderBy: "createTime desc",
-      }),
-      { label: "messages.list(matched)" },
-    );
+    const [msgsRes, senderMap] = await Promise.all([
+      withRetry(
+        () => getChat().spaces.messages.list({
+          parent: matchingSpace.name, pageSize, orderBy: "createTime desc",
+        }),
+        { label: "messages.list(matched)" },
+      ),
+      ensureSenderMap(matchingSpace.name),
+    ]);
     return (msgsRes.data.messages || []).map(msg => ({
-      ...formatMessage(msg), space: matchingSpace.displayName || matchingSpace.name,
+      ...formatMessage(msg, senderMap), space: matchingSpace.displayName || matchingSpace.name,
     }));
   }
 
@@ -526,9 +580,11 @@ async function searchMessages({ query, pageSize = 25 }) {
         () => getChat().spaces.messages.list({ parent: space.name, pageSize: 50, orderBy: "createTime desc" }),
         { label: `messages.list(${space.name})`, maxAttempts: 2 },
       );
-      for (const msg of msgsRes.data.messages || []) {
-        if (msg.text && msg.text.toLowerCase().includes(lowerQuery))
-          results.push({ ...formatMessage(msg), space: space.displayName || space.name });
+      const hits = (msgsRes.data.messages || []).filter((m) => m.text && m.text.toLowerCase().includes(lowerQuery));
+      if (!hits.length) return;
+      const senderMap = await ensureSenderMap(space.name);
+      for (const msg of hits) {
+        results.push({ ...formatMessage(msg, senderMap), space: space.displayName || space.name });
       }
     } catch {}
   }));
@@ -656,6 +712,7 @@ async function refreshCache() {
   nameCache = null;
   dmLabels = {};
   dmMembers = {};
+  senderMaps = {};
   selfNames = new Set();
   selfIdentity = null;
   lastDiag = null;
