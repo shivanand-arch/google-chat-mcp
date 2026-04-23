@@ -44,8 +44,15 @@ function addToCache(cache, name, spaceName, type, displayName) {
 
 async function ensureSpaces() {
   if (!allSpacesRaw) {
-    const res = await getChat().spaces.list({ pageSize: 200 });
-    allSpacesRaw = res.data.spaces || [];
+    const all = [];
+    let pageToken;
+    do {
+      const res = await getChat().spaces.list({ pageSize: 1000, pageToken });
+      if (res.data.spaces) all.push(...res.data.spaces);
+      pageToken = res.data.nextPageToken;
+    } while (pageToken);
+    allSpacesRaw = all;
+    log(`Fetched ${all.length} spaces total (paginated)`);
   }
   return allSpacesRaw;
 }
@@ -55,14 +62,8 @@ async function buildNameCache() {
   const spaces = await ensureSpaces();
   const cache = {};
 
-  for (const space of spaces) {
-    const type = space.spaceType || space.type;
-    const dn = space.displayName || "";
-    if (dn && !dn.startsWith("spaces/")) {
-      addToCache(cache, dn, space.name, type, dn);
-    }
-  }
-
+  // ── 1. Resolve DM names first so their first-name tokens (e.g. "priya")
+  //      win over any same-named keyword in a group space. ──
   const dmSpaces = spaces.filter(s =>
     (s.spaceType || s.type) === "DIRECT_MESSAGE" &&
     (!s.displayName || s.displayName.startsWith("spaces/"))
@@ -75,16 +76,45 @@ async function buildNameCache() {
         return { space, members: membersRes.data.memberships || [] };
       })
     );
-    let hits = 0, errors = 0;
+
+    // First pass: count name frequency. The caller appears in EVERY DM,
+    // so any name that appears in >1 DM is almost certainly the caller.
+    const nameFreq = {};
+    const perSpaceNames = [];
+    let errors = 0;
     for (const r of memberResults) {
       if (r.status !== "fulfilled") { errors++; continue; }
-      const { space, members } = r.value;
-      for (const m of members) {
-        const name = m.member?.displayName;
-        if (name) { addToCache(cache, name, space.name, "DIRECT_MESSAGE", name); hits++; }
+      const names = [];
+      for (const m of r.value.members) {
+        const n = m.member?.displayName;
+        if (n) { names.push(n); nameFreq[n] = (nameFreq[n] || 0) + 1; }
+      }
+      perSpaceNames.push({ space: r.value.space, names });
+    }
+    const selfNames = new Set(Object.entries(nameFreq).filter(([_, c]) => c > 1).map(([n]) => n));
+    if (selfNames.size > 0) log(`  Detected self: ${[...selfNames].join(", ")}`);
+
+    // Second pass: add only non-self names.
+    let hits = 0, emptyDms = 0;
+    for (const { space, names } of perSpaceNames) {
+      const others = names.filter(n => !selfNames.has(n));
+      if (others.length === 0) { emptyDms++; continue; }
+      for (const n of others) {
+        addToCache(cache, n, space.name, "DIRECT_MESSAGE", n);
+        hits++;
       }
     }
-    log(`  Members lookup: ${hits} names found, ${errors} errors`);
+    log(`  DM resolution: ${hits} names cached, ${errors} API errors, ${emptyDms} DMs with no resolvable member`);
+  }
+
+  // ── 2. Then add group/named spaces. Full-name keys still get set,
+  //      word-level keys only if the DM hasn't claimed them. ──
+  for (const space of spaces) {
+    const type = space.spaceType || space.type;
+    const dn = space.displayName || "";
+    if (dn && !dn.startsWith("spaces/")) {
+      addToCache(cache, dn, space.name, type, dn);
+    }
   }
 
   const keys = Object.keys(cache);
@@ -253,7 +283,7 @@ async function handleMessage(msg) {
 
   if (method === "initialize") {
     const clientVersion = params?.protocolVersion || "2024-11-05";
-    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.8.0" } } });
+    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.9.0" } } });
     return;
   }
   if (method?.startsWith("notifications/")) return;
@@ -309,4 +339,4 @@ process.stdin.on("end", () => process.exit(0));
 process.on("SIGTERM", () => process.exit(0));
 process.on("uncaughtException", (e) => log(`Uncaught: ${e.stack}`));
 process.on("unhandledRejection", (e) => log(`Rejection: ${e}`));
-log("server started (v0.8.0 — lazy auth, auto-install via start.js, DM-only person resolution, smart search)");
+log("server started (v0.9.0 — paginated spaces.list, DM-first name resolution, self-filter)");

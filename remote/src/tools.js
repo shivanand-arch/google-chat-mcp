@@ -32,20 +32,23 @@ function makeSessionCache() {
   return { spaces: null, nameCache: null };
 }
 
-async function listSpaces(chat, cache) {
-  if (!cache.spaces) {
-    const res = await chat.spaces.list({ pageSize: 200 });
-    cache.spaces = res.data.spaces || [];
-  }
-  return cache.spaces.map(formatSpace);
-}
-
 async function ensureSpacesRaw(chat, cache) {
   if (!cache.spaces) {
-    const res = await chat.spaces.list({ pageSize: 200 });
-    cache.spaces = res.data.spaces || [];
+    const all = [];
+    let pageToken;
+    do {
+      const res = await chat.spaces.list({ pageSize: 1000, pageToken });
+      if (res.data.spaces) all.push(...res.data.spaces);
+      pageToken = res.data.nextPageToken;
+    } while (pageToken);
+    cache.spaces = all;
   }
   return cache.spaces;
+}
+
+async function listSpaces(chat, cache) {
+  const spaces = await ensureSpacesRaw(chat, cache);
+  return spaces.map(formatSpace);
 }
 
 function addToCache(cache, name, spaceName, type, displayName) {
@@ -62,11 +65,9 @@ function addToCache(cache, name, spaceName, type, displayName) {
 async function buildNameCache(chat, cache) {
   const spaces = await ensureSpacesRaw(chat, cache);
   const nc = {};
-  for (const s of spaces) {
-    const type = s.spaceType || s.type;
-    const dn = s.displayName || "";
-    if (dn && !dn.startsWith("spaces/")) addToCache(nc, dn, s.name, type, dn);
-  }
+
+  // 1. Resolve DM names first so their first-name tokens (e.g. "priya") win
+  //    over any same-named keyword in a group space.
   const dmSpaces = spaces.filter(
     (s) => (s.spaceType || s.type) === "DIRECT_MESSAGE" && (!s.displayName || s.displayName.startsWith("spaces/")),
   );
@@ -77,14 +78,35 @@ async function buildNameCache(chat, cache) {
         return { space, members: r.data.memberships || [] };
       }),
     );
+
+    // Count name frequency: caller appears in every DM, so frequency > 1 => self.
+    const freq = {};
+    const perSpace = [];
     for (const r of results) {
       if (r.status !== "fulfilled") continue;
+      const names = [];
       for (const m of r.value.members) {
         const n = m.member?.displayName;
-        if (n) addToCache(nc, n, r.value.space.name, "DIRECT_MESSAGE", n);
+        if (n) { names.push(n); freq[n] = (freq[n] || 0) + 1; }
       }
+      perSpace.push({ space: r.value.space, names });
+    }
+    const selfNames = new Set(Object.entries(freq).filter(([_, c]) => c > 1).map(([n]) => n));
+
+    for (const { space, names } of perSpace) {
+      const others = names.filter((n) => !selfNames.has(n));
+      for (const n of others) addToCache(nc, n, space.name, "DIRECT_MESSAGE", n);
     }
   }
+
+  // 2. Then group/named spaces. Full-name keys still set; word-level keys only
+  //    if the DM hasn't already claimed them.
+  for (const s of spaces) {
+    const type = s.spaceType || s.type;
+    const dn = s.displayName || "";
+    if (dn && !dn.startsWith("spaces/")) addToCache(nc, dn, s.name, type, dn);
+  }
+
   cache.nameCache = nc;
   return nc;
 }
