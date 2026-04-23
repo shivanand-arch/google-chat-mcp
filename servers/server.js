@@ -55,6 +55,21 @@ function getChat() {
 const log = (msg) => process.stderr.write(`[google-chat] ${msg}\n`);
 function sendResponse(obj) { process.stdout.write(JSON.stringify(obj) + "\n"); }
 
+// Reject resource names with path traversal or query injection attempts.
+const DANGEROUS_CHARS = /[?#&<>|]/;
+function validateSpaceName(name) {
+  if (!name || typeof name !== "string") throw new Error("spaceName must be a non-empty string");
+  if (name.includes("..") || DANGEROUS_CHARS.test(name))
+    throw new Error(`Invalid spaceName: "${name}"`);
+  return name;
+}
+function validateMessageName(name) {
+  if (!name || typeof name !== "string") throw new Error("messageName must be a non-empty string");
+  if (name.includes("..") || DANGEROUS_CHARS.test(name))
+    throw new Error(`Invalid messageName: "${name}"`);
+  return name;
+}
+
 // ── Name cache ──
 let allSpacesRaw = null;
 let nameCache = null;
@@ -222,10 +237,33 @@ async function listSpaces() {
 }
 
 async function getMessages({ spaceName, pageSize = 25, filter = "" }) {
+  validateSpaceName(spaceName);
   const params = { parent: spaceName, pageSize, orderBy: "createTime desc" };
   if (filter) params.filter = filter;
   const res = await getChat().spaces.messages.list(params);
   return (res.data.messages || []).map(formatMessage);
+}
+
+async function getMessage({ messageName }) {
+  validateMessageName(messageName);
+  const res = await getChat().spaces.messages.get({ name: messageName });
+  return formatMessage(res.data);
+}
+
+async function editMessage({ messageName, text }) {
+  validateMessageName(messageName);
+  const res = await getChat().spaces.messages.patch({
+    name: messageName,
+    updateMask: "text",
+    requestBody: { text },
+  });
+  return formatMessage(res.data);
+}
+
+async function deleteMessage({ messageName }) {
+  validateMessageName(messageName);
+  await getChat().spaces.messages.delete({ name: messageName });
+  return { deleted: true, messageName };
 }
 
 async function searchMessages({ query, pageSize = 25 }) {
@@ -264,6 +302,7 @@ async function searchMessages({ query, pageSize = 25 }) {
 }
 
 async function sendMessage({ spaceName, text, threadName }) {
+  validateSpaceName(spaceName);
   const body = { text };
   if (threadName) body.thread = { name: threadName };
   const res = await getChat().spaces.messages.create({
@@ -274,6 +313,7 @@ async function sendMessage({ spaceName, text, threadName }) {
 }
 
 async function getSpace({ spaceName }) {
+  validateSpaceName(spaceName);
   const res = await getChat().spaces.get({ name: spaceName });
   const s = res.data;
   const type = s.spaceType || s.type;
@@ -350,6 +390,14 @@ async function sendToPerson({ personName, text, threadName }) {
   return await sendMessage({ spaceName, text, threadName });
 }
 
+async function refreshCache() {
+  allSpacesRaw = null;
+  nameCache = null;
+  dmLabels = {};
+  await buildNameCache();
+  return { refreshed: true, spaces: allSpacesRaw.length };
+}
+
 // ── Tool definitions ──
 const TOOLS = [
   { name: "list_spaces", description: "List all Google Chat spaces and DMs.", inputSchema: { type: "object", properties: {}, required: [] } },
@@ -359,6 +407,10 @@ const TOOLS = [
   { name: "get_space", description: "Get details about a space.", inputSchema: { type: "object", properties: { spaceName: { type: "string" } }, required: ["spaceName"] } },
   { name: "find_dm", description: "Find a person's DM space by name or nickname. Use before send_message when you only know a name.", inputSchema: { type: "object", properties: { personName: { type: "string" } }, required: ["personName"] } },
   { name: "send_to_person", description: "Send a DM to a person by name — resolves their space automatically. Use when user says 'send X to [person name]'.", inputSchema: { type: "object", properties: { personName: { type: "string" }, text: { type: "string" }, threadName: { type: "string" } }, required: ["personName", "text"] } },
+  { name: "get_message", description: "Get a single message by its full resource name (e.g. spaces/ABC/messages/XYZ).", inputSchema: { type: "object", properties: { messageName: { type: "string" } }, required: ["messageName"] } },
+  { name: "edit_message", description: "Edit the text of an existing message.", inputSchema: { type: "object", properties: { messageName: { type: "string" }, text: { type: "string" } }, required: ["messageName", "text"] } },
+  { name: "delete_message", description: "Delete a message by its full resource name.", inputSchema: { type: "object", properties: { messageName: { type: "string" } }, required: ["messageName"] } },
+  { name: "refresh_cache", description: "Force-refresh the spaces and name cache. Use if spaces or DMs are missing after changes.", inputSchema: { type: "object", properties: {}, required: [] } },
 ];
 
 // ── JSON-RPC handler ──
@@ -368,7 +420,7 @@ async function handleMessage(msg) {
 
   if (method === "initialize") {
     const clientVersion = params?.protocolVersion || "2024-11-05";
-    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.10.0" } } });
+    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.11.0" } } });
     return;
   }
   if (method?.startsWith("notifications/")) return;
@@ -389,6 +441,10 @@ async function handleMessage(msg) {
         case "get_space":       result = await getSpace(args); break;
         case "find_dm":         result = await findDm(args); break;
         case "send_to_person":  result = await sendToPerson(args); break;
+        case "get_message":     result = await getMessage(args); break;
+        case "edit_message":    result = await editMessage(args); break;
+        case "delete_message":  result = await deleteMessage(args); break;
+        case "refresh_cache":   result = await refreshCache(); break;
         default: throw new Error(`Unknown tool: ${toolName}`);
       }
       sendResponse({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] } });
@@ -424,4 +480,4 @@ process.stdin.on("end", () => process.exit(0));
 process.on("SIGTERM", () => process.exit(0));
 process.on("uncaughtException", (e) => log(`Uncaught: ${e.stack}`));
 process.on("unhandledRejection", (e) => log(`Rejection: ${e}`));
-log("server started (v0.10.0 — DM labels flow into list_spaces & get_space output)");
+log("server started (v0.11.0 — DM labels flow into list_spaces & get_space output)");
