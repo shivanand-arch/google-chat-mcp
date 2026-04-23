@@ -21,15 +21,26 @@ const formatMessage = (msg) => ({
   createTime: msg.createTime,
   thread: msg.thread?.name,
 });
-const formatSpace = (s) => ({
-  name: s.name,
-  displayName: s.displayName || s.name,
-  type: s.spaceType || s.type,
-});
+// Format a raw Google Chat space into our output shape. For DMs whose Google-
+// side displayName is empty or just the space id, substitute the resolved
+// counterparty name from the session's dmLabels map if available.
+function formatSpace(s, cache) {
+  const type = s.spaceType || s.type;
+  const raw = s.displayName || "";
+  let displayName = raw && !raw.startsWith("spaces/") ? raw : "";
+  const label = cache?.dmLabels?.[s.name];
+  if (!displayName && type === "DIRECT_MESSAGE" && label) {
+    displayName = `DM: ${label}`;
+  }
+  if (!displayName) displayName = s.name;
+  const out = { name: s.name, displayName, type };
+  if (type === "DIRECT_MESSAGE" && label) out.otherMember = label;
+  return out;
+}
 
 // Simple per-session cache so repeated tool calls don't re-list spaces.
 function makeSessionCache() {
-  return { spaces: null, nameCache: null };
+  return { spaces: null, nameCache: null, dmLabels: null };
 }
 
 async function ensureSpacesRaw(chat, cache) {
@@ -47,8 +58,10 @@ async function ensureSpacesRaw(chat, cache) {
 }
 
 async function listSpaces(chat, cache) {
+  // Trigger DM-member resolution so DM displayNames are useful strings.
+  if (!cache.nameCache) await buildNameCache(chat, cache);
   const spaces = await ensureSpacesRaw(chat, cache);
-  return spaces.map(formatSpace);
+  return spaces.map((s) => formatSpace(s, cache));
 }
 
 function addToCache(cache, name, spaceName, type, displayName) {
@@ -65,6 +78,7 @@ function addToCache(cache, name, spaceName, type, displayName) {
 async function buildNameCache(chat, cache) {
   const spaces = await ensureSpacesRaw(chat, cache);
   const nc = {};
+  const dmLabels = {}; // spaceName → "Person A, Person B" (non-self members)
 
   // 1. Resolve DM names first so their first-name tokens (e.g. "priya") win
   //    over any same-named keyword in a group space.
@@ -96,6 +110,7 @@ async function buildNameCache(chat, cache) {
     for (const { space, names } of perSpace) {
       const others = names.filter((n) => !selfNames.has(n));
       for (const n of others) addToCache(nc, n, space.name, "DIRECT_MESSAGE", n);
+      if (others.length > 0) dmLabels[space.name] = others.join(", ");
     }
   }
 
@@ -108,6 +123,7 @@ async function buildNameCache(chat, cache) {
   }
 
   cache.nameCache = nc;
+  cache.dmLabels = dmLabels;
   return nc;
 }
 
@@ -180,9 +196,34 @@ async function sendMessage(chat, _cache, { spaceName, text, threadName }) {
   return formatMessage(res.data);
 }
 
-async function getSpace(chat, _cache, { spaceName }) {
+async function getSpace(chat, cache, { spaceName }) {
   const res = await chat.spaces.get({ name: spaceName });
-  return formatSpace(res.data);
+  const s = res.data;
+  const type = s.spaceType || s.type;
+  // For DMs without a useful displayName, fetch members once to enrich.
+  if (type === "DIRECT_MESSAGE" && (!s.displayName || s.displayName.startsWith("spaces/")) && !cache.dmLabels?.[spaceName]) {
+    try {
+      const m = await chat.spaces.members.list({ parent: spaceName, pageSize: 20 });
+      const members = (m.data.memberships || [])
+        .map((x) => x.member?.displayName)
+        .filter(Boolean);
+      // If we already know self from an earlier buildNameCache pass, filter them out.
+      const self = new Set(
+        cache.nameCache
+          ? Object.values(cache.nameCache)
+              .filter((v) => v.type === "DIRECT_MESSAGE")
+              .map((v) => v.displayName)
+          : []
+      );
+      const others = members.filter((n) => !self.has(n));
+      const label = (others.length ? others : members).join(", ");
+      if (label) {
+        cache.dmLabels ||= {};
+        cache.dmLabels[spaceName] = label;
+      }
+    } catch {}
+  }
+  return formatSpace(s, cache);
 }
 
 async function findDm(chat, cache, { personName }) {

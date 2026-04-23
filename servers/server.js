@@ -29,6 +29,7 @@ function sendResponse(obj) { process.stdout.write(JSON.stringify(obj) + "\n"); }
 // ── Name cache ──
 let allSpacesRaw = null;
 let nameCache = null;
+let dmLabels = {}; // spaceName → "Person A, Person B" (non-self members of each DM)
 
 function addToCache(cache, name, spaceName, type, displayName) {
   if (!name) return;
@@ -94,8 +95,9 @@ async function buildNameCache() {
     const selfNames = new Set(Object.entries(nameFreq).filter(([_, c]) => c > 1).map(([n]) => n));
     if (selfNames.size > 0) log(`  Detected self: ${[...selfNames].join(", ")}`);
 
-    // Second pass: add only non-self names.
+    // Second pass: add only non-self names; also build dmLabels map.
     let hits = 0, emptyDms = 0;
+    const labels = {};
     for (const { space, names } of perSpaceNames) {
       const others = names.filter(n => !selfNames.has(n));
       if (others.length === 0) { emptyDms++; continue; }
@@ -103,7 +105,9 @@ async function buildNameCache() {
         addToCache(cache, n, space.name, "DIRECT_MESSAGE", n);
         hits++;
       }
+      labels[space.name] = others.join(", ");
     }
+    dmLabels = labels;
     log(`  DM resolution: ${hits} names cached, ${errors} API errors, ${emptyDms} DMs with no resolvable member`);
   }
 
@@ -167,15 +171,23 @@ function formatMessage(msg) {
   };
 }
 function formatSpace(space) {
-  return {
-    name: space.name,
-    displayName: space.displayName || space.name,
-    type: space.spaceType || space.type,
-  };
+  const type = space.spaceType || space.type;
+  const raw = space.displayName || "";
+  let displayName = raw && !raw.startsWith("spaces/") ? raw : "";
+  const label = dmLabels?.[space.name];
+  if (!displayName && type === "DIRECT_MESSAGE" && label) {
+    displayName = `DM: ${label}`;
+  }
+  if (!displayName) displayName = space.name;
+  const out = { name: space.name, displayName, type };
+  if (type === "DIRECT_MESSAGE" && label) out.otherMember = label;
+  return out;
 }
 
 // ── Tool implementations ──
 async function listSpaces() {
+  // Trigger DM-member resolution so DM displayNames are useful strings.
+  if (!nameCache) await buildNameCache();
   const spaces = await ensureSpaces();
   return spaces.map(formatSpace);
 }
@@ -234,7 +246,29 @@ async function sendMessage({ spaceName, text, threadName }) {
 
 async function getSpace({ spaceName }) {
   const res = await getChat().spaces.get({ name: spaceName });
-  return formatSpace(res.data);
+  const s = res.data;
+  const type = s.spaceType || s.type;
+  // For DMs without a useful displayName, fetch members once to enrich.
+  if (type === "DIRECT_MESSAGE" && (!s.displayName || s.displayName.startsWith("spaces/")) && !dmLabels[spaceName]) {
+    try {
+      const m = await getChat().spaces.members.list({ parent: spaceName, pageSize: 20 });
+      const members = (m.data.memberships || [])
+        .map((x) => x.member?.displayName)
+        .filter(Boolean);
+      // If we already know self from buildNameCache, filter them out.
+      const self = new Set(
+        nameCache
+          ? Object.values(nameCache)
+              .filter((v) => v.type === "DIRECT_MESSAGE")
+              .map((v) => v.displayName)
+          : []
+      );
+      const others = members.filter((n) => !self.has(n));
+      const label = (others.length ? others : members).join(", ");
+      if (label) dmLabels[spaceName] = label;
+    } catch {}
+  }
+  return formatSpace(s);
 }
 
 async function findDm({ personName }) {
@@ -283,7 +317,7 @@ async function handleMessage(msg) {
 
   if (method === "initialize") {
     const clientVersion = params?.protocolVersion || "2024-11-05";
-    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.9.0" } } });
+    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.10.0" } } });
     return;
   }
   if (method?.startsWith("notifications/")) return;
@@ -339,4 +373,4 @@ process.stdin.on("end", () => process.exit(0));
 process.on("SIGTERM", () => process.exit(0));
 process.on("uncaughtException", (e) => log(`Uncaught: ${e.stack}`));
 process.on("unhandledRejection", (e) => log(`Rejection: ${e}`));
-log("server started (v0.9.0 — paginated spaces.list, DM-first name resolution, self-filter)");
+log("server started (v0.10.0 — DM labels flow into list_spaces & get_space output)");
