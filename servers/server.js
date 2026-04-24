@@ -546,50 +546,88 @@ async function deleteMessage({ messageName }) {
   return { deleted: true, messageName };
 }
 
+// Tokens too short or too common to be meaningful name-matches.
+const SEARCH_STOPWORDS = new Set([
+  "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "at", "by", "with",
+]);
+// Accuracy > economy: don't cap fan-out. If 50 spaces match "ECC", we search all 50.
+// (withRetry + allSettled absorbs rate-limit blips; the caller can always narrow the query.)
+const SEARCH_PAGE_PER_SPACE = 100;   // one page per candidate — anything older is out of scope
+const SEARCH_GLOBAL_PAGE = 50;       // smaller page when we're grepping every space in the org
+const SEARCH_RESULT_HARD_CAP = 200;  // ceiling on consolidated hits returned to caller
+
+function tokenizeQuery(lower) {
+  const toks = lower.split(/\s+/).filter((t) => t.length >= 2 && !SEARCH_STOPWORDS.has(t));
+  return toks.length ? toks : [lower];
+}
+
 async function searchMessages({ query, pageSize = 25 }) {
   const spaces = await ensureSpaces();
-  const lowerQuery = query.toLowerCase();
+  const lower = query.toLowerCase();
+  const qTokens = tokenizeQuery(lower);
 
-  const matchingSpace = spaces.find(s => {
+  // Candidate set = every space whose displayName contains the full query OR any non-trivial token.
+  // For queries like "panic room" / "ECC" / "RCA" this returns ALL label-matches, not a picked winner.
+  const targets = spaces.filter((s) => {
     const dn = (s.displayName || "").toLowerCase();
     if (!dn || dn.startsWith("spaces/")) return false;
-    return dn.includes(lowerQuery) || lowerQuery.includes(dn) ||
-      lowerQuery.split(/\s+/).every(w => w.length > 1 && dn.includes(w));
+    if (dn.includes(lower)) return true;
+    return qTokens.some((t) => dn.includes(t));
   });
 
-  if (matchingSpace) {
-    log(`  search matched space: ${matchingSpace.displayName} (${matchingSpace.name})`);
-    const [msgsRes, senderMap] = await Promise.all([
-      withRetry(
-        () => getChat().spaces.messages.list({
-          parent: matchingSpace.name, pageSize, orderBy: "createTime desc",
-        }),
-        { label: "messages.list(matched)" },
-      ),
-      ensureSenderMap(matchingSpace.name),
-    ]);
-    return (msgsRes.data.messages || []).map(msg => ({
-      ...formatMessage(msg, senderMap), space: matchingSpace.displayName || matchingSpace.name,
+  const results = [];
+  const seen = new Set();
+  const pushHit = (m, space, senderMap) => {
+    if (seen.has(m.name)) return;
+    seen.add(m.name);
+    results.push({ ...formatMessage(m, senderMap), space: space.displayName || space.name });
+  };
+
+  if (targets.length > 0) {
+    // Exactly one space with the full query as a displayName substring → browse mode (no text filter).
+    const soloBrowse = targets.length === 1 && targets[0].displayName &&
+      targets[0].displayName.toLowerCase().includes(lower);
+    log(`  search candidates: ${targets.length}${soloBrowse ? " (browse mode)" : ""}`);
+
+    await Promise.allSettled(targets.map(async (space) => {
+      try {
+        const msgsRes = await withRetry(
+          () => getChat().spaces.messages.list({
+            parent: space.name,
+            pageSize: soloBrowse ? pageSize : SEARCH_PAGE_PER_SPACE,
+            orderBy: "createTime desc",
+          }),
+          { label: `messages.list(${space.name})`, maxAttempts: 2 },
+        );
+        const msgs = msgsRes.data.messages || [];
+        const hits = soloBrowse ? msgs : msgs.filter((m) => m.text && m.text.toLowerCase().includes(lower));
+        if (!hits.length) return;
+        const senderMap = await ensureSenderMap(space.name);
+        for (const m of hits) pushHit(m, space, senderMap);
+      } catch {}
     }));
+    results.sort((a, b) => new Date(b.createTime) - new Date(a.createTime));
+    if (results.length > 0) {
+      const cap = soloBrowse ? pageSize : Math.min(SEARCH_RESULT_HARD_CAP, Math.max(pageSize, results.length));
+      return results.slice(0, cap);
+    }
   }
 
-  const results = [];
+  // No name-match hits anywhere → global text grep across every space the user is in.
   await Promise.allSettled(spaces.map(async (space) => {
     try {
       const msgsRes = await withRetry(
-        () => getChat().spaces.messages.list({ parent: space.name, pageSize: 50, orderBy: "createTime desc" }),
+        () => getChat().spaces.messages.list({ parent: space.name, pageSize: SEARCH_GLOBAL_PAGE, orderBy: "createTime desc" }),
         { label: `messages.list(${space.name})`, maxAttempts: 2 },
       );
-      const hits = (msgsRes.data.messages || []).filter((m) => m.text && m.text.toLowerCase().includes(lowerQuery));
+      const hits = (msgsRes.data.messages || []).filter((m) => m.text && m.text.toLowerCase().includes(lower));
       if (!hits.length) return;
       const senderMap = await ensureSenderMap(space.name);
-      for (const msg of hits) {
-        results.push({ ...formatMessage(msg, senderMap), space: space.displayName || space.name });
-      }
+      for (const m of hits) pushHit(m, space, senderMap);
     } catch {}
   }));
   results.sort((a, b) => new Date(b.createTime) - new Date(a.createTime));
-  return results.slice(0, pageSize);
+  return results.slice(0, Math.min(SEARCH_RESULT_HARD_CAP, Math.max(pageSize, results.length)));
 }
 
 async function sendMessage({
@@ -788,7 +826,7 @@ async function debugDmResolution() {
 const TOOLS = [
   { name: "list_spaces", description: "List all Google Chat spaces and DMs.", inputSchema: { type: "object", properties: {}, required: [] } },
   { name: "get_messages", description: "Get recent messages from a space.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, pageSize: { type: "number" }, filter: { type: "string" } }, required: ["spaceName"] } },
-  { name: "search_messages", description: "Search messages across ALL spaces in parallel. If the query matches a space/group name, returns messages from that space. Otherwise searches message text across all spaces.", inputSchema: { type: "object", properties: { query: { type: "string" }, pageSize: { type: "number" } }, required: ["query"] } },
+  { name: "search_messages", description: "Search messages across ALL spaces the user is in. Fan-out: (1) candidate spaces = every space whose displayName contains the full query or any non-trivial token (e.g. \"panic room\" → every Panic Room space, \"ECC\" → every ECC space), then grep each in parallel with space labels on results; (2) if no label hits, fall back to global text grep across all spaces. Correctness-first — cost scales with number of matching spaces.", inputSchema: { type: "object", properties: { query: { type: "string" }, pageSize: { type: "number" } }, required: ["query"] } },
   { name: "send_message", description: "Send a message to a space. Supports plain text, cardsV2, threaded replies (threadName/threadKey), messageId (idempotency), and privateMessageViewer.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, text: { type: "string" }, cardsV2: { type: "array" }, threadName: { type: "string" }, threadKey: { type: "string" }, replyOption: { type: "string" }, messageId: { type: "string" }, privateToUserId: { type: "string" } }, required: ["spaceName"] } },
   { name: "get_space", description: "Get details about a space including members (for DMs).", inputSchema: { type: "object", properties: { spaceName: { type: "string" } }, required: ["spaceName"] } },
   { name: "find_dm", description: "Find a person's DM space by name or nickname. Use before send_message when you only know a name.", inputSchema: { type: "object", properties: { personName: { type: "string" } }, required: ["personName"] } },
@@ -809,7 +847,7 @@ async function handleMessage(msg) {
 
   if (method === "initialize") {
     const clientVersion = params?.protocolVersion || "2024-11-05";
-    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.14.0" } } });
+    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.15.0" } } });
     return;
   }
   if (method?.startsWith("notifications/")) return;
@@ -875,4 +913,4 @@ process.stdin.on("end", () => process.exit(0));
 process.on("SIGTERM", () => process.exit(0));
 process.on("uncaughtException", (e) => log(`Uncaught: ${e.stack}`));
 process.on("unhandledRejection", (e) => log(`Rejection: ${e}`));
-log("server started (v0.14.0 — parity with remote: rich send schemas, debug_dm_resolution, buildNameCache diagnostics)");
+log("server started (v0.15.0 — search_messages multi-candidate fan-out with space-labeled hits)");
