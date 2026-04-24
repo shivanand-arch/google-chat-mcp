@@ -8,7 +8,7 @@
       "name": "google-chat",
       "source": ".",
       "description": "Connect Claude Code to Google Chat — read, search, summarise, and send messages",
-      "version": "1.3.0"
+      "version": "1.3.2"
     }
   ]
 }
