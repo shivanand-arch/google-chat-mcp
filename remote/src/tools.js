@@ -504,19 +504,66 @@ const SEARCH_STOPWORDS = new Set([
 ]);
 // Accuracy > economy: don't cap fan-out. If 50 spaces match "ECC", we search all 50.
 // (withRetry + allSettled absorbs rate-limit blips; the caller can always narrow the query.)
-const SEARCH_PAGE_PER_SPACE = 100;   // one page per candidate — anything older is out of scope
-const SEARCH_GLOBAL_PAGE = 50;       // smaller page when we're grepping every space in the org
-const SEARCH_RESULT_HARD_CAP = 200;  // ceiling on consolidated hits returned to caller
+const SEARCH_API_PAGE_SIZE = 100;           // messages per API page
+const SEARCH_MAX_PAGES_PER_SPACE = 6;       // per-space hard stop: 6 × 100 = 600 messages
+const SEARCH_TOTAL_MSG_BUDGET = 20000;      // org-wide safety net across all scanned spaces
+const SEARCH_RESULT_HARD_CAP = 200;         // ceiling on consolidated hits returned to caller
+const SEARCH_DEFAULT_SINCE_DAYS = 30;       // default time window for text grep
+const SEARCH_MAX_SINCE_DAYS = 365;          // clamp to protect runtime
 
 function tokenizeQuery(lower) {
   const toks = lower.split(/\s+/).filter((t) => t.length >= 2 && !SEARCH_STOPWORDS.has(t));
   return toks.length ? toks : [lower];
 }
 
-async function searchMessages(chat, cache, { query, pageSize = 25 }) {
+// Paginate through messages in a space within the time window, up to per-space cap.
+// Filters server-side via Google Chat API's `filter: "createTime > ..."` so quiet
+// spaces cost ~1 page, not 6. textFilter=false collects all messages (browse mode).
+async function scanSpaceForText(chat, space, { lower, timeFilter, textFilter = true, budget }) {
+  const hits = [];
+  let pageToken;
+  let pages = 0;
+  let truncated = false;
+  do {
+    const params = {
+      parent: space.name,
+      pageSize: SEARCH_API_PAGE_SIZE,
+      orderBy: "createTime desc",
+    };
+    if (pageToken) params.pageToken = pageToken;
+    if (timeFilter) params.filter = timeFilter;
+    const r = await withRetry(
+      () => chat.spaces.messages.list(params),
+      { label: `messages.list(${space.name})`, maxAttempts: 2 },
+    );
+    const msgs = r.data.messages || [];
+    pages++;
+    for (const m of msgs) {
+      if (!textFilter) hits.push(m);
+      else if (m.text && m.text.toLowerCase().includes(lower)) hits.push(m);
+    }
+    if (budget) {
+      budget.remaining -= msgs.length;
+      if (budget.remaining <= 0) { truncated = true; break; }
+    }
+    pageToken = r.data.nextPageToken;
+    if (pages >= SEARCH_MAX_PAGES_PER_SPACE) { truncated = !!pageToken; break; }
+  } while (pageToken);
+  return { hits, pages, truncated };
+}
+
+async function searchMessages(chat, cache, { query, pageSize = 25, sinceDays }) {
   const spaces = await ensureSpacesRaw(chat, cache);
   const lower = query.toLowerCase();
   const qTokens = tokenizeQuery(lower);
+
+  const effectiveDays = Math.min(
+    SEARCH_MAX_SINCE_DAYS,
+    Math.max(1, sinceDays ?? SEARCH_DEFAULT_SINCE_DAYS),
+  );
+  const sinceIso = new Date(Date.now() - effectiveDays * 86400000).toISOString();
+  const timeFilter = `createTime > "${sinceIso}"`;
+  const budget = { remaining: SEARCH_TOTAL_MSG_BUDGET };
 
   // Candidate set = every space whose displayName contains the full query OR any non-trivial token.
   // For queries like "panic room" / "ECC" / "RCA" this returns ALL label-matches, not a picked winner.
@@ -536,22 +583,25 @@ async function searchMessages(chat, cache, { query, pageSize = 25 }) {
   };
 
   if (targets.length > 0) {
-    // Exactly one space with the full query as a displayName substring → browse mode (no text filter).
+    // Exactly one space with the full query as a displayName substring → browse mode
+    // (return newest pageSize messages from that space, no text or time filter).
     const soloBrowse = targets.length === 1 && targets[0].displayName &&
       targets[0].displayName.toLowerCase().includes(lower);
 
+    if (soloBrowse) {
+      const space = targets[0];
+      const r = await withRetry(
+        () => chat.spaces.messages.list({ parent: space.name, pageSize, orderBy: "createTime desc" }),
+        { label: `messages.list(${space.name})`, maxAttempts: 2 },
+      );
+      const senderMap = await ensureSenderMap(chat, cache, space.name);
+      for (const m of r.data.messages || []) pushHit(m, space, senderMap);
+      return results.slice(0, pageSize);
+    }
+
     await Promise.allSettled(targets.map(async (space) => {
       try {
-        const r = await withRetry(
-          () => chat.spaces.messages.list({
-            parent: space.name,
-            pageSize: soloBrowse ? pageSize : SEARCH_PAGE_PER_SPACE,
-            orderBy: "createTime desc",
-          }),
-          { label: `messages.list(${space.name})`, maxAttempts: 2 },
-        );
-        const msgs = r.data.messages || [];
-        const hits = soloBrowse ? msgs : msgs.filter((m) => m.text && m.text.toLowerCase().includes(lower));
+        const { hits } = await scanSpaceForText(chat, space, { lower, timeFilter, textFilter: true, budget });
         if (!hits.length) return;
         const senderMap = await ensureSenderMap(chat, cache, space.name);
         for (const m of hits) pushHit(m, space, senderMap);
@@ -559,20 +609,14 @@ async function searchMessages(chat, cache, { query, pageSize = 25 }) {
     }));
     results.sort((a, b) => new Date(b.createTime) - new Date(a.createTime));
     if (results.length > 0) {
-      // Multi-space fan-out: return enough so caller sees hits across every matching space.
-      const cap = soloBrowse ? pageSize : Math.min(SEARCH_RESULT_HARD_CAP, Math.max(pageSize, results.length));
-      return results.slice(0, cap);
+      return results.slice(0, Math.min(SEARCH_RESULT_HARD_CAP, Math.max(pageSize, results.length)));
     }
   }
 
-  // No name-match hits anywhere → global text grep across every space the user is in.
+  // No name-match hits anywhere → global text grep across every space within the time window.
   await Promise.allSettled(spaces.map(async (space) => {
     try {
-      const r = await withRetry(
-        () => chat.spaces.messages.list({ parent: space.name, pageSize: SEARCH_GLOBAL_PAGE, orderBy: "createTime desc" }),
-        { label: `messages.list(${space.name})`, maxAttempts: 2 },
-      );
-      const hits = (r.data.messages || []).filter((m) => m.text && m.text.toLowerCase().includes(lower));
+      const { hits } = await scanSpaceForText(chat, space, { lower, timeFilter, textFilter: true, budget });
       if (!hits.length) return;
       const senderMap = await ensureSenderMap(chat, cache, space.name);
       for (const m of hits) pushHit(m, space, senderMap);
@@ -729,7 +773,7 @@ async function sendToPerson(chat, cache, { personName, text, threadName, cardsV2
 export const TOOLS = [
   { name: "list_spaces", description: "List all Google Chat spaces and DMs.", inputSchema: { type: "object", properties: {}, required: [] } },
   { name: "get_messages", description: "Get recent messages from a space.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, pageSize: { type: "number" }, filter: { type: "string" } }, required: ["spaceName"] } },
-  { name: "search_messages", description: "Search messages across ALL spaces the user is in. Fan-out: (1) candidate spaces = every space whose displayName contains the full query or any non-trivial token (e.g. \"panic room\" → every Panic Room space, \"ECC\" → every ECC space), then grep each in parallel with space labels on results; (2) if no label hits, fall back to global text grep across all spaces. Correctness-first — cost scales with number of matching spaces.", inputSchema: { type: "object", properties: { query: { type: "string" }, pageSize: { type: "number" } }, required: ["query"] } },
+  { name: "search_messages", description: "Search messages across ALL spaces the user is in, within a time window (default: last 30 days). Fan-out: (1) candidate spaces = every space whose displayName contains the full query or any non-trivial token (e.g. \"panic room\" → every Panic Room space, \"ECC\" → every ECC space), then grep each in parallel with space labels on results; (2) if no label hits, fall back to global text grep across all spaces. Uses server-side createTime filter + paginates up to 600 messages per space. If a result is expected but not returned, widen the window via sinceDays.", inputSchema: { type: "object", properties: { query: { type: "string" }, pageSize: { type: "number" }, sinceDays: { type: "number", description: "Look back this many days (default 30, max 365). Increase for older messages." } }, required: ["query"] } },
   { name: "send_message", description: "Send a message to a space. Supports plain text, cardsV2, threaded replies (threadName/threadKey), messageId (idempotency), and privateMessageViewer.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, text: { type: "string" }, cardsV2: { type: "array" }, threadName: { type: "string" }, threadKey: { type: "string" }, replyOption: { type: "string" }, messageId: { type: "string" }, privateToUserId: { type: "string" } }, required: ["spaceName"] } },
   { name: "get_space", description: "Get details about a space including members (for DMs).", inputSchema: { type: "object", properties: { spaceName: { type: "string" } }, required: ["spaceName"] } },
   { name: "find_dm", description: "Find a person's DM space by name or nickname. Use before send_message when you only know a name.", inputSchema: { type: "object", properties: { personName: { type: "string" } }, required: ["personName"] } },

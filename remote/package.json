@@ -1,6 +1,6 @@
 {
   "name": "google-chat-mcp-remote",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Remote MCP server for Google Chat — HTTP + OAuth 2.1, deployable to Railway",
   "private": true,
   "type": "module",
