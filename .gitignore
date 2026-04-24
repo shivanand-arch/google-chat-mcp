@@ -1,3 +1,9 @@
 node_modules/
 .env
 .mcpb-cache/
+
+# Never commit the Exotel employee directory (private HR data from Flexiele)
+email_index.json
+**/email_index.json
+data/email_index*
+

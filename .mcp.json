@@ -3,7 +3,7 @@
     "google-chat": {
       "command": "node",
       "args": [
-        "${CLAUDE_PLUGIN_ROOT}/servers/server.js"
+        "${CLAUDE_PLUGIN_ROOT}/servers/start.js"
       ],
       "env": {
         "GOOGLE_CLIENT_ID": "${GOOGLE_CLIENT_ID}",
