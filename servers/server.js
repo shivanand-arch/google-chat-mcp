@@ -2,33 +2,15 @@ import { google } from "googleapis";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { homedir } from "os";
 import { dirname } from "path";
-
-// ── Employee directory email index (written by /employee-directory skill) ──
-const EMAIL_INDEX_PATH = `${homedir()}/.claude/skills/employee-directory/data/email_index.json`;
-let _emailIndex = null;
-function getEmailIndex() {
-  if (_emailIndex) return _emailIndex;
-  try {
-    _emailIndex = JSON.parse(readFileSync(EMAIL_INDEX_PATH, "utf8"));
-  } catch {
-    _emailIndex = {};
-  }
-  return _emailIndex;
-}
-function lookupEmailFromDirectory(personName) {
-  const index = getEmailIndex();
-  const query = personName.toLowerCase().trim();
-  if (index[query]) return index[query];
-  // partial: any index key that starts with the query word, or vice-versa
-  for (const [name, email] of Object.entries(index)) {
-    const nameParts = name.split(" ");
-    const queryParts = query.split(" ");
-    if (queryParts.every((qp) => nameParts.some((np) => np.startsWith(qp)))) {
-      return email;
-    }
-  }
-  return null;
-}
+import { createHash } from "crypto";
+import { TOOLS } from "../remote/src/shared/tools.js";
+import { matchDirectoryByName } from "../remote/src/shared/email-index.js";
+import { resolveNameToSpace } from "../remote/src/shared/resolve-dm.js";
+import { formatMessage } from "../remote/src/shared/format.js";
+import { aggregateThreadsInSpace } from "../remote/src/shared/threads-aggregate.js";
+import { listAllMembers } from "../remote/src/shared/members-list.js";
+import { assertSpaceType } from "../remote/src/shared/space-type-guard.js";
+import { loadCache, saveCache, isStale, CACHE_FILE_PATH } from "./local-cache.js";
 
 // ── Credentials (set via env vars) ──
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
@@ -228,6 +210,38 @@ let dmMembers = {}; // spaceName → array of raw member displayNames (for get_s
 let senderMaps = {}; // spaceName → { "users/XXX": "Display Name" } for sender-name enrichment
 let lastDiag = null; // diagnostics from last buildNameCache run, exposed via debug_dm_resolution
 
+// Stable per-account fingerprint for the on-disk cache. Hashing the refresh
+// token (not the access token, which rotates) gives us isolation if a user
+// switches accounts without leaking the secret to disk.
+let _userFingerprint = null;
+function getUserFingerprint() {
+  if (_userFingerprint) return _userFingerprint;
+  if (!REFRESH_TOKEN) return null;
+  _userFingerprint = createHash("sha256").update(REFRESH_TOKEN).digest("hex").slice(0, 16);
+  return _userFingerprint;
+}
+
+// Warm-start: try to populate module state from the on-disk cache.
+// Safe even when called before credentials are configured — without a
+// refresh token we can't compute a fingerprint, so loadCache returns null.
+// On stale cache we keep the data anyway (the next refresh_cache or first
+// tool call will rebuild) — better to serve stale-but-fast than slow.
+function warmFromDisk() {
+  const fp = getUserFingerprint();
+  if (!fp) return;
+  const cached = loadCache(fp);
+  if (!cached) return;
+  allSpacesRaw = cached.spaces;
+  nameCache = cached.nameCache;
+  dmLabels = cached.dmLabels || {};
+  dmMembers = cached.dmMembers || {};
+  selfNames = new Set(cached.selfNames || []);
+  const ageMin = Math.round((Date.now() - cached.savedAt) / 60000);
+  const stale = isStale(cached);
+  log(`Warm-started from ${CACHE_FILE_PATH} (${cached.spaces?.length || 0} spaces, ` +
+      `${Object.keys(cached.nameCache || {}).length} name keys, age ${ageMin}m${stale ? ", stale" : ""})`);
+}
+
 // Chat API omits sender.displayName under user-auth. But USER_MENTION
 // annotations on messages carry the mentioned user's ID + the text position,
 // so anyone @mentioned in the space becomes resolvable for free.
@@ -330,11 +344,12 @@ async function buildNameCache() {
     log(`  Fetching members for ${dmSpaces.length} unnamed DM spaces...`);
     const memberResults = await Promise.allSettled(
       dmSpaces.map(async (space) => {
-        const membersRes = await withRetry(
-          () => getChat().spaces.members.list({ parent: space.name, pageSize: 20 }),
-          { label: `members.list(${space.name})` },
-        );
-        return { space, members: membersRes.data.memberships || [] };
+        const r = await listAllMembers(getChat(), space.name, {
+          withRetry,
+          label: `members.list(${space.name})`,
+          maxAttempts: 3,
+        });
+        return { space, members: r.memberships };
       })
     );
 
@@ -419,54 +434,23 @@ async function buildNameCache() {
   const keys = Object.keys(cache);
   log(`Name cache built: ${keys.length} entries`);
   nameCache = cache;
+  // Persist warm state so the next process start skips the cold fetch.
+  // Best-effort: never let a write failure break the in-memory build.
+  try {
+    saveCache({
+      userId: getUserFingerprint(),
+      spaces: allSpacesRaw || [],
+      nameCache,
+      dmLabels,
+      dmMembers,
+      selfNames: [...selfNames],
+    });
+  } catch (e) { log(`local-cache save failed: ${e.message}`); }
   return cache;
 }
 
-function fuzzyMatch(query, key) {
-  if (key.includes(query) || query.includes(key)) return true;
-  const queryWords = query.split(/\s+/).filter(w => w.length > 1);
-  if (queryWords.length > 0 && queryWords.every(w => key.includes(w))) return true;
-  if (queryWords.some(w => key.includes(w) && w.length >= 3)) return true;
-  return false;
-}
-
-async function findSpaceByName(personName, { dmOnly = false } = {}) {
-  if (!nameCache) await buildNameCache();
-  const query = personName.toLowerCase().trim();
-
-  // Exact match
-  if (nameCache[query]) {
-    const entry = nameCache[query];
-    if (!dmOnly || entry.type === "DIRECT_MESSAGE") return entry.spaceName;
-  }
-
-  // Fuzzy match
-  const matches = [];
-  for (const [key, entry] of Object.entries(nameCache)) {
-    if (dmOnly && entry.type !== "DIRECT_MESSAGE") continue;
-    if (fuzzyMatch(query, key)) matches.push({ key, ...entry });
-  }
-  if (matches.length === 1) return matches[0].spaceName;
-  if (matches.length > 1) {
-    // Prefer shorter keys (more specific matches)
-    return matches.sort((a, b) => a.key.length - b.key.length)[0].spaceName;
-  }
-
-  return null;
-}
-
 // ── Helpers ──
-function formatMessage(msg, senderMap = {}) {
-  const id = msg.sender?.name;
-  return {
-    name: msg.name,
-    text: msg.text || "(no text)",
-    sender: msg.sender?.displayName || senderMap[id] || id || "Unknown",
-    senderId: id,
-    createTime: msg.createTime,
-    thread: msg.thread?.name,
-  };
-}
+// formatMessage → shared/format.js (thread + threadKey + inThread for room threads)
 function formatSpace(space) {
   const type = space.spaceType || space.type;
   const raw = space.displayName || "";
@@ -676,12 +660,19 @@ async function searchMessages({ query, pageSize = 25, sinceDays }) {
 }
 
 async function sendMessage({
-  spaceName, text, cardsV2, threadName, threadKey, replyOption, messageId, privateToUserId,
+  spaceName, text, cardsV2, threadName, threadKey, replyOption, messageId, privateToUserId, expectType,
 }) {
   validateSpaceName(spaceName);
   if (!text && !cardsV2) throw new Error("send_message requires text or cardsV2");
   if (messageId) validateResourceName(messageId, "messageId");
   if (threadName) validateResourceName(threadName, "threadName");
+
+  if (expectType) {
+    await assertSpaceType(getChat(), spaceName, expectType, {
+      cachedSpaces: allSpacesRaw,
+      withRetry,
+    });
+  }
 
   const body = {};
   if (text) body.text = text;
@@ -717,11 +708,12 @@ async function getSpace({ spaceName }) {
   const type = s.spaceType || s.type;
   if (type === "DIRECT_MESSAGE" && !dmMembers[spaceName]) {
     try {
-      const m = await withRetry(
-        () => getChat().spaces.members.list({ parent: spaceName, pageSize: 20 }),
-        { label: "members.list(get_space)" },
-      );
-      const memberships = m.data.memberships || [];
+      const m = await listAllMembers(getChat(), spaceName, {
+        withRetry,
+        label: "members.list(get_space)",
+        maxAttempts: 3,
+      });
+      const memberships = m.memberships;
       const allNames = memberships.map(x => x.member?.displayName).filter(Boolean);
       // Use authoritative isSelfMember check (userId match), fall back to name match.
       const otherNames = memberships
@@ -738,25 +730,100 @@ async function getSpace({ spaceName }) {
   return formatSpace(s);
 }
 
-// Resolve personName → DM space. Order: cache → employee-directory email
-// → findDirectMessage. Returns { spaceName, resolvedVia, email? } or null.
-async function resolvePersonToDm(personName) {
-  const cached = await findSpaceByName(personName, { dmOnly: true });
-  if (cached) return { spaceName: cached, resolvedVia: "cache" };
+async function listSpaceThreads({ spaceName, maxPages = 4 }) {
+  validateSpaceName(spaceName);
+  if (!nameCache) await buildNameCache();
+  const all = await ensureSpaces();
+  const s = all.find((x) => x.name === spaceName);
+  const spaceLabel = s ? formatSpace(s) : { displayName: spaceName };
 
-  const email = lookupEmailFromDirectory(personName);
-  if (email) {
+  const maxP = Math.min(10, Math.max(1, Number(maxPages) || 4));
+  const collected = [];
+  let pageToken;
+  for (let p = 0; p < maxP; p++) {
+    const params = {
+      parent: spaceName,
+      pageSize: 100,
+      orderBy: "createTime desc",
+    };
+    if (pageToken) params.pageToken = pageToken;
+    const r = await withRetry(
+      () => getChat().spaces.messages.list(params),
+      { label: `messages.list(threads:${spaceName})`, maxAttempts: 2 },
+    );
+    const msgs = r.data.messages || [];
+    collected.push(...msgs);
+    pageToken = r.data.nextPageToken;
+    if (!pageToken) break;
+  }
+
+  const { threads, unthreadedTopLevel } = aggregateThreadsInSpace(collected, {
+    maxThreadRows: 50,
+    maxUnthreaded: 15,
+  });
+  return {
+    spaceName,
+    spaceDisplayName: spaceLabel.displayName || spaceName,
+    scannedMessageCount: collected.length,
+    note:
+      "A space can have many threads. Each `thread` is the resource id for that thread — use it as `threadName` when replying. " +
+      "Informal thread names (what people say aloud) are not in the API; match them against the `snippet` text below.",
+    threads,
+    unthreadedTopLevel,
+  };
+}
+
+function formatAmbiguousError(personName, resolved) {
+  if (resolved.source === "name_cache") {
+    const lines = resolved.candidates.map(
+      (c) => `  - ${c.displayName} (${c.spaceName}) [matched: ${c.matchedKey}]`,
+    );
+    return `Ambiguous name "${personName}": several DMs match. Ask the user to pick one.\n${lines.join("\n")}`;
+  }
+  const lines = resolved.directoryMatches.map(
+    (m) => `  - ${m.name} <${m.email}>`,
+  );
+  return `Ambiguous name "${personName}": several people match in the employee directory. Ask the user to pick one.\n${lines.join("\n")}`;
+}
+
+// Resolve personName → DM space. Order: name cache (no silent multi-match) →
+// employee directory (ambiguous returns explicit list) → findDirectMessage.
+async function resolvePersonToDm(personName) {
+  if (!nameCache) await buildNameCache();
+  const nameHit = resolveNameToSpace(nameCache, personName, { dmOnly: true });
+  if (nameHit.status === "unique") {
+    return {
+      spaceName: nameHit.spaceName,
+      resolvedVia: "cache",
+      matchType: nameHit.matchType,
+      displayName: nameHit.displayName,
+    };
+  }
+  if (nameHit.status === "ambiguous") {
+    return { ambiguous: true, source: "name_cache", candidates: nameHit.candidates };
+  }
+
+  const dir = matchDirectoryByName(personName);
+  if (dir.kind === "ambiguous") {
+    return { ambiguous: true, source: "directory", directoryMatches: dir.matches };
+  }
+  if (dir.kind === "unique") {
     try {
-      validateResourceName(email, "email");
+      validateResourceName(dir.email, "email");
       const res = await withRetry(
-        () => getChat().spaces.findDirectMessage({ name: `users/${email}` }),
+        () => getChat().spaces.findDirectMessage({ name: `users/${dir.email}` }),
         { label: "findDirectMessage", maxAttempts: 2 },
       );
       if (res.data?.name) {
-        return { spaceName: res.data.name, resolvedVia: "findDirectMessage", email };
+        return {
+          spaceName: res.data.name,
+          resolvedVia: "findDirectMessage",
+          email: dir.email,
+          directoryKey: dir.directoryKey,
+        };
       }
     } catch (e) {
-      log(`findDirectMessage(${email}) failed: ${formatApiError(e)}`);
+      log(`findDirectMessage(${dir.email}) failed: ${formatApiError(e)}`);
     }
   }
   return null;
@@ -764,6 +831,20 @@ async function resolvePersonToDm(personName) {
 
 async function findDm({ personName }) {
   const resolved = await resolvePersonToDm(personName);
+  if (resolved?.ambiguous) {
+    if (resolved.source === "name_cache") {
+      return {
+        found: "ambiguous",
+        reason: "Multiple DM spaces match; user must disambiguate.",
+        candidates: resolved.candidates,
+      };
+    }
+    return {
+      found: "ambiguous",
+      reason: "Multiple employee directory entries match; user must disambiguate.",
+      directoryMatches: resolved.directoryMatches,
+    };
+  }
   if (resolved) return { found: true, ...resolved };
 
   if (!nameCache) await buildNameCache();
@@ -777,6 +858,9 @@ async function findDm({ personName }) {
 
 async function sendToPerson({ personName, text, threadName, cardsV2, messageId }) {
   const resolved = await resolvePersonToDm(personName);
+  if (resolved?.ambiguous) {
+    throw new Error(formatAmbiguousError(personName, resolved));
+  }
   if (!resolved) {
     if (!nameCache) await buildNameCache();
     const names = Object.entries(nameCache)
@@ -816,13 +900,15 @@ async function whoami() {
   };
 }
 
-async function getMembers({ spaceName, pageSize = 50 }) {
+async function getMembers({ spaceName, pageSize = 100 }) {
   validateSpaceName(spaceName);
-  const res = await withRetry(
-    () => getChat().spaces.members.list({ parent: spaceName, pageSize }),
-    { label: "members.list" },
-  );
-  return (res.data.memberships || []).map(m => ({
+  const r = await listAllMembers(getChat(), spaceName, {
+    withRetry,
+    label: "members.list",
+    pageSize,
+    maxAttempts: 3,
+  });
+  const out = r.memberships.map(m => ({
     name: m.name,
     state: m.state,
     role: m.role,
@@ -831,6 +917,10 @@ async function getMembers({ spaceName, pageSize = 50 }) {
     type: m.member?.type,
     isSelf: isSelfMember(m),
   }));
+  if (r.truncated) {
+    return { members: out, truncated: true, pages: r.pages, note: "Member list truncated at page cap (5000)." };
+  }
+  return out;
 }
 
 // Diagnostic: force a fresh DM-resolution pass and report counters.
@@ -867,23 +957,8 @@ async function debugDmResolution() {
   };
 }
 
-// ── Tool definitions ──
-const TOOLS = [
-  { name: "list_spaces", description: "List all Google Chat spaces and DMs.", inputSchema: { type: "object", properties: {}, required: [] } },
-  { name: "get_messages", description: "Get recent messages from a space.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, pageSize: { type: "number" }, filter: { type: "string" } }, required: ["spaceName"] } },
-  { name: "search_messages", description: "Search messages across ALL spaces the user is in, within a time window (default: last 30 days). Fan-out: (1) candidate spaces = every space whose displayName contains the full query or any non-trivial token (e.g. \"panic room\" → every Panic Room space, \"ECC\" → every ECC space), then grep each in parallel with space labels on results; (2) if no label hits, fall back to global text grep across all spaces. Uses server-side createTime filter + paginates up to 600 messages per space. If a result is expected but not returned, widen the window via sinceDays.", inputSchema: { type: "object", properties: { query: { type: "string" }, pageSize: { type: "number" }, sinceDays: { type: "number", description: "Look back this many days (default 30, max 365). Increase for older messages." } }, required: ["query"] } },
-  { name: "send_message", description: "Send a message to a space. Supports plain text, cardsV2, threaded replies (threadName/threadKey), messageId (idempotency), and privateMessageViewer.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, text: { type: "string" }, cardsV2: { type: "array" }, threadName: { type: "string" }, threadKey: { type: "string" }, replyOption: { type: "string" }, messageId: { type: "string" }, privateToUserId: { type: "string" } }, required: ["spaceName"] } },
-  { name: "get_space", description: "Get details about a space including members (for DMs).", inputSchema: { type: "object", properties: { spaceName: { type: "string" } }, required: ["spaceName"] } },
-  { name: "find_dm", description: "Find a person's DM space by name or nickname. Use before send_message when you only know a name.", inputSchema: { type: "object", properties: { personName: { type: "string" } }, required: ["personName"] } },
-  { name: "send_to_person", description: "Send a DM to a person by name — resolves their space automatically. Use when user says 'send X to [person name]'.", inputSchema: { type: "object", properties: { personName: { type: "string" }, text: { type: "string" }, cardsV2: { type: "array" }, threadName: { type: "string" }, messageId: { type: "string" } }, required: ["personName"] } },
-  { name: "get_message", description: "Get a single message by its full resource name (e.g. spaces/ABC/messages/XYZ).", inputSchema: { type: "object", properties: { messageName: { type: "string" } }, required: ["messageName"] } },
-  { name: "edit_message", description: "Edit the text or cardsV2 content of an existing message.", inputSchema: { type: "object", properties: { messageName: { type: "string" }, text: { type: "string" }, cardsV2: { type: "array" } }, required: ["messageName"] } },
-  { name: "delete_message", description: "Delete a message by its full resource name.", inputSchema: { type: "object", properties: { messageName: { type: "string" } }, required: ["messageName"] } },
-  { name: "get_members", description: "List members of a space with role, state, and isSelf flag.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, pageSize: { type: "number" } }, required: ["spaceName"] } },
-  { name: "whoami", description: "Return the authenticated caller's identity (email, displayName, userId). Use when unsure which account is authenticated or to debug DM self-filtering.", inputSchema: { type: "object", properties: {}, required: [] } },
-  { name: "refresh_cache", description: "Force-refresh the spaces, members, and name cache.", inputSchema: { type: "object", properties: {}, required: [] } },
-  { name: "debug_dm_resolution", description: "Diagnostic tool: forces a fresh DM-name resolution pass and returns counters.", inputSchema: { type: "object", properties: {}, required: [] } },
-];
+// Tool definitions imported from shared/tools.js — single source of truth
+// shared between local stdio and remote HTTP runtimes.
 
 // ── JSON-RPC handler ──
 async function handleMessage(msg) {
@@ -908,6 +983,7 @@ async function handleMessage(msg) {
       switch (toolName) {
         case "list_spaces":     result = await listSpaces(); break;
         case "get_messages":    result = await getMessages(args); break;
+        case "list_space_threads": result = await listSpaceThreads(args); break;
         case "search_messages": result = await searchMessages(args); break;
         case "send_message":    result = await sendMessage(args); break;
         case "get_space":       result = await getSpace(args); break;
@@ -958,4 +1034,5 @@ process.stdin.on("end", () => process.exit(0));
 process.on("SIGTERM", () => process.exit(0));
 process.on("uncaughtException", (e) => log(`Uncaught: ${e.stack}`));
 process.on("unhandledRejection", (e) => log(`Rejection: ${e}`));
-log("server started (v0.16.0 — search_messages with time window + pagination)");
+warmFromDisk();
+log("server started (v0.17.0 — paginated members, expectType guard, on-disk cache)");

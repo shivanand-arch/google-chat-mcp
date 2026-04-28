@@ -3,34 +3,12 @@
 // access token. Token refresh is handled transparently via googleapis.
 
 import { google } from "googleapis";
-import { readFileSync } from "fs";
-import { homedir } from "os";
-
-// ── Employee directory email index (written by /employee-directory skill) ──
-const EMAIL_INDEX_PATH = `${homedir()}/.claude/skills/employee-directory/data/email_index.json`;
-let _emailIndex = null;
-function getEmailIndex() {
-  if (_emailIndex) return _emailIndex;
-  try {
-    _emailIndex = JSON.parse(readFileSync(EMAIL_INDEX_PATH, "utf8"));
-  } catch {
-    _emailIndex = {};
-  }
-  return _emailIndex;
-}
-function lookupEmailFromDirectory(personName) {
-  const index = getEmailIndex();
-  const query = personName.toLowerCase().trim();
-  if (index[query]) return index[query];
-  for (const [name, email] of Object.entries(index)) {
-    const nameParts = name.split(" ");
-    const queryParts = query.split(" ");
-    if (queryParts.every((qp) => nameParts.some((np) => np.startsWith(qp)))) {
-      return email;
-    }
-  }
-  return null;
-}
+import { matchDirectoryByName } from "./shared/email-index.js";
+import { resolveNameToSpace } from "./shared/resolve-dm.js";
+import { formatMessage } from "./shared/format.js";
+import { aggregateThreadsInSpace } from "./shared/threads-aggregate.js";
+import { listAllMembers } from "./shared/members-list.js";
+import { assertSpaceType } from "./shared/space-type-guard.js";
 
 function makeChatClient({ google: g, googleClientId, googleClientSecret }) {
   const oauth2 = new google.auth.OAuth2(googleClientId, googleClientSecret);
@@ -127,17 +105,6 @@ function isSelfMember(member, cache) {
   return false;
 }
 
-const formatMessage = (msg, senderMap = {}) => {
-  const id = msg.sender?.name;
-  return {
-    name: msg.name,
-    text: msg.text || "(no text)",
-    sender: msg.sender?.displayName || senderMap[id] || id || "Unknown",
-    senderId: id,
-    createTime: msg.createTime,
-    thread: msg.thread?.name,
-  };
-};
 // Format a Google Chat space. Never leaks the raw space ID as displayName —
 // the LLM may render that ID as if it were a person's name in summaries.
 function formatSpace(s, cache) {
@@ -301,11 +268,12 @@ async function buildNameCache(chat, cache) {
   if (dmSpaces.length > 0) {
     const results = await Promise.allSettled(
       dmSpaces.map(async (space) => {
-        const r = await withRetry(
-          () => chat.spaces.members.list({ parent: space.name, pageSize: 20 }),
-          { label: `members.list(${space.name})` },
-        );
-        return { space, members: r.data.memberships || [] };
+        const r = await listAllMembers(chat, space.name, {
+          withRetry,
+          label: `members.list(${space.name})`,
+          maxAttempts: 3,
+        });
+        return { space, members: r.memberships };
       }),
     );
 
@@ -381,31 +349,6 @@ async function buildNameCache(chat, cache) {
   return nc;
 }
 
-function fuzzyMatch(query, key) {
-  if (key.includes(query) || query.includes(key)) return true;
-  const words = query.split(/\s+/).filter((w) => w.length > 1);
-  if (words.length > 0 && words.every((w) => key.includes(w))) return true;
-  if (words.some((w) => key.includes(w) && w.length >= 3)) return true;
-  return false;
-}
-
-async function findSpaceByName(chat, cache, personName, { dmOnly = false } = {}) {
-  if (!cache.nameCache) await buildNameCache(chat, cache);
-  const q = personName.toLowerCase().trim();
-  if (cache.nameCache[q]) {
-    const e = cache.nameCache[q];
-    if (!dmOnly || e.type === "DIRECT_MESSAGE") return e.spaceName;
-  }
-  const matches = [];
-  for (const [key, entry] of Object.entries(cache.nameCache)) {
-    if (dmOnly && entry.type !== "DIRECT_MESSAGE") continue;
-    if (fuzzyMatch(q, key)) matches.push({ key, ...entry });
-  }
-  if (matches.length === 1) return matches[0].spaceName;
-  if (matches.length > 1) return matches.sort((a, b) => a.key.length - b.key.length)[0].spaceName;
-  return null;
-}
-
 async function getMessages(chat, cache, { spaceName, pageSize = 25, filter = "" }) {
   validateResourceName(spaceName, "spaceName");
   const params = { parent: spaceName, pageSize, orderBy: "createTime desc" };
@@ -457,13 +400,15 @@ async function deleteMessage(chat, _cache, { messageName }) {
   return { deleted: true, messageName };
 }
 
-async function getMembers(chat, cache, { spaceName, pageSize = 50 }) {
+async function getMembers(chat, cache, { spaceName, pageSize = 100 }) {
   validateResourceName(spaceName, "spaceName");
-  const res = await withRetry(
-    () => chat.spaces.members.list({ parent: spaceName, pageSize }),
-    { label: "members.list" },
-  );
-  return (res.data.memberships || []).map((m) => ({
+  const r = await listAllMembers(chat, spaceName, {
+    withRetry,
+    label: "members.list",
+    pageSize,
+    maxAttempts: 3,
+  });
+  const out = r.memberships.map((m) => ({
     name: m.name,
     state: m.state,
     role: m.role,
@@ -472,6 +417,10 @@ async function getMembers(chat, cache, { spaceName, pageSize = 50 }) {
     type: m.member?.type,
     isSelf: isSelfMember(m, cache),
   }));
+  if (r.truncated) {
+    return { members: out, truncated: true, pages: r.pages, note: "Member list truncated at page cap (5000)." };
+  }
+  return out;
 }
 
 async function whoami(_chat, cache) {
@@ -626,13 +575,20 @@ async function searchMessages(chat, cache, { query, pageSize = 25, sinceDays }) 
   return results.slice(0, Math.min(SEARCH_RESULT_HARD_CAP, Math.max(pageSize, results.length)));
 }
 
-async function sendMessage(chat, _cache, {
-  spaceName, text, cardsV2, threadName, threadKey, replyOption, messageId, privateToUserId,
+async function sendMessage(chat, cache, {
+  spaceName, text, cardsV2, threadName, threadKey, replyOption, messageId, privateToUserId, expectType,
 }) {
   validateResourceName(spaceName, "spaceName");
   if (!text && !cardsV2) throw new Error("send_message requires text or cardsV2");
   if (messageId) validateResourceName(messageId, "messageId");
   if (threadName) validateResourceName(threadName, "threadName");
+
+  if (expectType) {
+    await assertSpaceType(chat, spaceName, expectType, {
+      cachedSpaces: cache?.spaces,
+      withRetry,
+    });
+  }
 
   const body = {};
   if (text) body.text = text;
@@ -663,11 +619,12 @@ async function getSpace(chat, cache, { spaceName }) {
   const type = s.spaceType || s.type;
   if (type === "DIRECT_MESSAGE" && !cache.dmMembers[spaceName]) {
     try {
-      const m = await withRetry(
-        () => chat.spaces.members.list({ parent: spaceName, pageSize: 20 }),
-        { label: "members.list(get_space)" },
-      );
-      const memberships = m.data.memberships || [];
+      const m = await listAllMembers(chat, spaceName, {
+        withRetry,
+        label: "members.list(get_space)",
+        maxAttempts: 3,
+      });
+      const memberships = m.memberships;
       const allNames = memberships.map((x) => x.member?.displayName).filter(Boolean);
       // Authoritative self check via OAuth session identity; fall back to cached selfNames.
       const otherNames = memberships
@@ -687,33 +644,129 @@ async function getSpace(chat, cache, { spaceName }) {
   return formatSpace(s, cache);
 }
 
-async function resolvePersonToDm(chat, cache, personName) {
-  const cached = await findSpaceByName(chat, cache, personName, { dmOnly: true });
-  if (cached) return { spaceName: cached, resolvedVia: "cache" };
+/**
+ * Scans recent messages in one space, groups by `thread` (Chat's canonical id
+ * for that conversation). Users can refer to the same thread by many names;
+ * this maps snippets → thread id for `send_message(..., threadName)`.
+ */
+async function listSpaceThreads(chat, cache, { spaceName, maxPages = 4 }) {
+  validateResourceName(spaceName, "spaceName");
+  if (!cache.nameCache) await buildNameCache(chat, cache);
+  const all = await ensureSpacesRaw(chat, cache);
+  const s = all.find((x) => x.name === spaceName);
+  const spaceLabel = s ? formatSpace(s, cache) : { displayName: spaceName };
 
-  const email = lookupEmailFromDirectory(personName);
-  if (email) {
+  const maxP = Math.min(10, Math.max(1, Number(maxPages) || 4));
+  const collected = [];
+  let pageToken;
+  for (let p = 0; p < maxP; p++) {
+    const params = {
+      parent: spaceName,
+      pageSize: 100,
+      orderBy: "createTime desc",
+    };
+    if (pageToken) params.pageToken = pageToken;
+    const r = await withRetry(
+      () => chat.spaces.messages.list(params),
+      { label: `messages.list(threads:${spaceName})`, maxAttempts: 2 },
+    );
+    const msgs = r.data.messages || [];
+    collected.push(...msgs);
+    pageToken = r.data.nextPageToken;
+    if (!pageToken) break;
+  }
+
+  const { threads, unthreadedTopLevel } = aggregateThreadsInSpace(collected, {
+    maxThreadRows: 50,
+    maxUnthreaded: 15,
+  });
+  return {
+    spaceName,
+    spaceDisplayName: spaceLabel.displayName || spaceName,
+    scannedMessageCount: collected.length,
+    note:
+      "A space can have many threads. Each `thread` is the resource id for that thread — use it as `threadName` when replying. " +
+      "Informal thread names (what people say aloud) are not in the API; match them against the `snippet` text below.",
+    threads,
+    unthreadedTopLevel,
+  };
+}
+
+async function resolvePersonToDm(chat, cache, personName) {
+  if (!cache.nameCache) await buildNameCache(chat, cache);
+  const nameHit = resolveNameToSpace(cache.nameCache, personName, { dmOnly: true });
+  if (nameHit.status === "unique") {
+    return {
+      spaceName: nameHit.spaceName,
+      resolvedVia: "cache",
+      matchType: nameHit.matchType,
+      displayName: nameHit.displayName,
+    };
+  }
+  if (nameHit.status === "ambiguous") {
+    return { ambiguous: true, source: "name_cache", candidates: nameHit.candidates };
+  }
+
+  const dir = matchDirectoryByName(personName);
+  if (dir.kind === "ambiguous") {
+    return { ambiguous: true, source: "directory", directoryMatches: dir.matches };
+  }
+  if (dir.kind === "unique") {
     try {
-      validateResourceName(email, "email");
+      validateResourceName(dir.email, "email");
       const res = await withRetry(
-        () => chat.spaces.findDirectMessage({ name: `users/${email}` }),
+        () => chat.spaces.findDirectMessage({ name: `users/${dir.email}` }),
         { label: "findDirectMessage", maxAttempts: 2 },
       );
       if (res.data?.name) {
-        return { spaceName: res.data.name, resolvedVia: "findDirectMessage", email };
+        return {
+          spaceName: res.data.name,
+          resolvedVia: "findDirectMessage",
+          email: dir.email,
+          directoryKey: dir.directoryKey,
+        };
       }
     } catch (err) {
       console.log("[findDirectMessage.err]", JSON.stringify({
-        email, error: formatApiError(err),
+        email: dir.email, error: formatApiError(err),
       }));
     }
   }
   return null;
 }
 
+function formatAmbiguousError(personName, resolved) {
+  if (resolved.source === "name_cache") {
+    const lines = resolved.candidates.map(
+      (c) => `  - ${c.displayName} (${c.spaceName}) [matched: ${c.matchedKey}]`,
+    );
+    return `Ambiguous name "${personName}": several DMs match. Ask the user to pick one.\n${lines.join("\n")}`;
+  }
+  const lines = resolved.directoryMatches.map(
+    (m) => `  - ${m.name} <${m.email}>`,
+  );
+  return `Ambiguous name "${personName}": several people match in the employee directory. Ask the user to pick one.\n${lines.join("\n")}`;
+}
+
 async function findDm(chat, cache, { personName }) {
   const resolved = await resolvePersonToDm(chat, cache, personName);
-  if (resolved) return { found: true, ...resolved };
+  if (resolved?.ambiguous) {
+    if (resolved.source === "name_cache") {
+      return {
+        found: "ambiguous",
+        reason: "Multiple DM spaces match; user must disambiguate.",
+        candidates: resolved.candidates,
+      };
+    }
+    return {
+      found: "ambiguous",
+      reason: "Multiple employee directory entries match; user must disambiguate.",
+      directoryMatches: resolved.directoryMatches,
+    };
+  }
+  if (resolved) {
+    return { found: true, ...resolved };
+  }
 
   if (!cache.nameCache) await buildNameCache(chat, cache);
   const available = Object.entries(cache.nameCache)
@@ -755,6 +808,9 @@ async function debugDmResolution(chat, cache) {
 
 async function sendToPerson(chat, cache, { personName, text, threadName, cardsV2, messageId }) {
   const resolved = await resolvePersonToDm(chat, cache, personName);
+  if (resolved?.ambiguous) {
+    throw new Error(formatAmbiguousError(personName, resolved));
+  }
   if (!resolved) {
     if (!cache.nameCache) await buildNameCache(chat, cache);
     const names = Object.entries(cache.nameCache)
@@ -770,26 +826,14 @@ async function sendToPerson(chat, cache, { personName, text, threadName, cardsV2
   return { ...sent, resolvedVia: resolved.resolvedVia, email: resolved.email };
 }
 
-export const TOOLS = [
-  { name: "list_spaces", description: "List all Google Chat spaces and DMs.", inputSchema: { type: "object", properties: {}, required: [] } },
-  { name: "get_messages", description: "Get recent messages from a space.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, pageSize: { type: "number" }, filter: { type: "string" } }, required: ["spaceName"] } },
-  { name: "search_messages", description: "Search messages across ALL spaces the user is in, within a time window (default: last 30 days). Fan-out: (1) candidate spaces = every space whose displayName contains the full query or any non-trivial token (e.g. \"panic room\" → every Panic Room space, \"ECC\" → every ECC space), then grep each in parallel with space labels on results; (2) if no label hits, fall back to global text grep across all spaces. Uses server-side createTime filter + paginates up to 600 messages per space. If a result is expected but not returned, widen the window via sinceDays.", inputSchema: { type: "object", properties: { query: { type: "string" }, pageSize: { type: "number" }, sinceDays: { type: "number", description: "Look back this many days (default 30, max 365). Increase for older messages." } }, required: ["query"] } },
-  { name: "send_message", description: "Send a message to a space. Supports plain text, cardsV2, threaded replies (threadName/threadKey), messageId (idempotency), and privateMessageViewer.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, text: { type: "string" }, cardsV2: { type: "array" }, threadName: { type: "string" }, threadKey: { type: "string" }, replyOption: { type: "string" }, messageId: { type: "string" }, privateToUserId: { type: "string" } }, required: ["spaceName"] } },
-  { name: "get_space", description: "Get details about a space including members (for DMs).", inputSchema: { type: "object", properties: { spaceName: { type: "string" } }, required: ["spaceName"] } },
-  { name: "find_dm", description: "Find a person's DM space by name or nickname. Use before send_message when you only know a name.", inputSchema: { type: "object", properties: { personName: { type: "string" } }, required: ["personName"] } },
-  { name: "send_to_person", description: "Send a DM to a person by name — resolves their space automatically. Use when user says 'send X to [person name]'.", inputSchema: { type: "object", properties: { personName: { type: "string" }, text: { type: "string" }, cardsV2: { type: "array" }, threadName: { type: "string" }, messageId: { type: "string" } }, required: ["personName"] } },
-  { name: "get_message", description: "Get a single message by its full resource name.", inputSchema: { type: "object", properties: { messageName: { type: "string" } }, required: ["messageName"] } },
-  { name: "edit_message", description: "Edit the text or cardsV2 content of an existing message.", inputSchema: { type: "object", properties: { messageName: { type: "string" }, text: { type: "string" }, cardsV2: { type: "array" } }, required: ["messageName"] } },
-  { name: "delete_message", description: "Delete a message by its full resource name.", inputSchema: { type: "object", properties: { messageName: { type: "string" } }, required: ["messageName"] } },
-  { name: "get_members", description: "List members of a space with role, state, and isSelf flag.", inputSchema: { type: "object", properties: { spaceName: { type: "string" }, pageSize: { type: "number" } }, required: ["spaceName"] } },
-  { name: "whoami", description: "Return the authenticated caller's identity from the OAuth session.", inputSchema: { type: "object", properties: {}, required: [] } },
-  { name: "refresh_cache", description: "Force-refresh the spaces, members, and name cache for this session.", inputSchema: { type: "object", properties: {}, required: [] } },
-  { name: "debug_dm_resolution", description: "Diagnostic tool: forces a fresh DM-name resolution pass and returns counters.", inputSchema: { type: "object", properties: {}, required: [] } },
-];
+// Tool surface is the single source of truth in shared/tools.js. Re-exported
+// here so existing `import { TOOLS } from "./tools.js"` call-sites keep working.
+export { TOOLS } from "./shared/tools.js";
 
 const HANDLERS = {
   list_spaces: listSpaces,
   get_messages: getMessages,
+  list_space_threads: listSpaceThreads,
   search_messages: searchMessages,
   send_message: sendMessage,
   get_space: getSpace,
