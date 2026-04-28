@@ -23,6 +23,10 @@ const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/chat.spaces.readonly",
   "https://www.googleapis.com/auth/chat.messages",
   "https://www.googleapis.com/auth/chat.memberships.readonly",
+  // directory.readonly: resolve `users/<id>` → display name via People API.
+  // Closes the gap where members.list returns null displayName for DMs under
+  // user auth, and where group-space orphans are never @mentioned. v0.12.0+.
+  "https://www.googleapis.com/auth/directory.readonly",
 ].join(" ");
 
 function verifyPkce(verifier, challenge, method) {

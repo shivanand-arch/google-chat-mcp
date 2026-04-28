@@ -57,6 +57,9 @@ Create (or reuse) an OAuth 2.0 **Web application** client at [console.cloud.goog
 - `https://www.googleapis.com/auth/chat.spaces.readonly`
 - `https://www.googleapis.com/auth/chat.messages`
 - `https://www.googleapis.com/auth/chat.memberships.readonly`
+- `https://www.googleapis.com/auth/directory.readonly` — People API fallback to resolve `users/<id>` → display name when @mention harvest and DM-member listing miss a user. **Without this scope, all DMs surface as "DM (unresolved)" because `members.list` returns null `displayName` for DMs under user auth.**
+
+> Existing connectors authorized before v0.12.0 will need to be reconnected after upgrading — the directory scope is new and a fresh consent is required.
 
 Note the **Client ID** and **Client Secret**. You'll add the redirect URI in step 3 once you know the Railway URL.
 
