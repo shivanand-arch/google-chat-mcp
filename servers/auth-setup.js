@@ -22,6 +22,10 @@ const SCOPES = [
   "https://www.googleapis.com/auth/chat.spaces.readonly",
   "https://www.googleapis.com/auth/chat.messages",
   "https://www.googleapis.com/auth/chat.memberships.readonly",
+  // directory.readonly: People API fallback for `users/<id>` → name resolution.
+  // Required for DM partner names (members.list omits displayName under user
+  // auth) and for resolving orphan senders never @mentioned in our spaces.
+  "https://www.googleapis.com/auth/directory.readonly",
 ];
 
 const oauth2Client = new google.auth.OAuth2(

@@ -10,6 +10,7 @@ import { formatMessage } from "../remote/src/shared/format.js";
 import { aggregateThreadsInSpace } from "../remote/src/shared/threads-aggregate.js";
 import { listAllMembers } from "../remote/src/shared/members-list.js";
 import { assertSpaceType } from "../remote/src/shared/space-type-guard.js";
+import { resolveViaDirectory, collectOrphanSenders } from "../remote/src/shared/people-resolver.js";
 import { loadCache, saveCache, isStale, CACHE_FILE_PATH } from "./local-cache.js";
 
 // ── Credentials (set via env vars) ──
@@ -20,6 +21,7 @@ const REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
 // Lazily initialized — server starts even without credentials so Claude Code
 // can connect. A clear error is returned when tools are actually called.
 let _chat = null;
+let _people = null;
 let _oauth2Client = null;
 function getOAuth2Client() {
   if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN) {
@@ -37,6 +39,13 @@ function getOAuth2Client() {
 function getChat() {
   if (!_chat) _chat = google.chat({ version: "v1", auth: getOAuth2Client() });
   return _chat;
+}
+// People API client — directory.readonly fallback for resolving `users/<id>`
+// when @mention harvesting and DM-member listing miss a name. Lazy so the
+// server starts before credentials are configured.
+function getPeople() {
+  if (!_people) _people = google.people({ version: "v1", auth: getOAuth2Client() });
+  return _people;
 }
 
 const log = (msg) => process.stderr.write(`[google-chat] ${msg}\n`);
@@ -335,6 +344,32 @@ function harvestIntoGlobal(messages) {
   }
 }
 
+// People API safety net for orphan senders. Called after the @mention harvest;
+// any sender whose userId is still missing from the global map gets a
+// directory lookup. Resolved names are folded in and persisted.
+async function enrichOrphansViaPeopleAPI(messages, label = "people.batchGet(orphans)") {
+  if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN) return 0;
+  const orphans = collectOrphanSenders(messages, globalSenderMap);
+  if (orphans.size === 0) return 0;
+  let added = 0;
+  try {
+    const resolved = await resolveViaDirectory(getPeople(), orphans, { withRetry, label });
+    for (const [uid, name] of resolved) {
+      if (!globalSenderMap[uid]) {
+        globalSenderMap[uid] = name;
+        added++;
+      }
+    }
+  } catch (err) {
+    log(`[enrichOrphans.err] ${err?.message}`);
+  }
+  if (added > 0) {
+    senderMapDirty = true;
+    schedulePersistSenderMap();
+  }
+  return added;
+}
+
 function spaceNameFromMessage(messageName) {
   const m = /^(spaces\/[^/]+)\//.exec(messageName || "");
   return m ? m[1] : null;
@@ -410,11 +445,12 @@ async function buildNameCache() {
       })
     );
 
-    // First pass: collect names + detect self.
-    // Primary signal: userId match via selfIdentity (authoritative).
-    // Fallback: frequency — the caller appears in EVERY DM.
-    const nameFreq = {};
-    const perSpaceNames = [];
+    // First pass: collect raw member records (uid + displayName-if-any) per space.
+    // Under user auth, members.list returns null displayName for DMs, so we
+    // capture the userId regardless and let People API enrichment fill the
+    // name. Without this, every DM stays "DM (unresolved)".
+    const perSpaceRecords = [];
+    const orphanUids = new Set();
     for (const r of memberResults) {
       if (r.status !== "fulfilled") {
         diag.memberListErr++;
@@ -425,7 +461,7 @@ async function buildNameCache() {
         continue;
       }
       diag.memberListOk++;
-      const names = [];
+      const records = [];
       for (const m of r.value.members) {
         if (!diag.firstSampleMember) {
           diag.firstSampleMember = {
@@ -436,22 +472,59 @@ async function buildNameCache() {
             memberType: m.member?.type || null,
           };
         }
-        const n = m.member?.displayName;
-        if (!n) continue;
-        // Seed the global sender resolver. m.member.name = "users/<ID>", which
-        // is exactly the key formatMessage() needs. DM members are the only
-        // place members.list exposes displayName under user auth, so this is
-        // the cheapest userId → name harvest available.
         const uid = m.member?.name;
-        if (uid && !globalSenderMap[uid]) {
-          globalSenderMap[uid] = n;
+        if (!uid || !uid.startsWith("users/")) continue;
+        const dn = m.member?.displayName || null;
+        if (!dn && !globalSenderMap[uid]) orphanUids.add(uid);
+        records.push({ uid, displayName: dn, member: m });
+      }
+      perSpaceRecords.push({ space: r.value.space, records });
+    }
+
+    // People API safety net: any DM partner with null displayName AND no prior
+    // @mention sighting → resolve via directory and fold into the global map.
+    if (orphanUids.size > 0 && CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN) {
+      try {
+        const resolved = await resolveViaDirectory(getPeople(), orphanUids, {
+          withRetry,
+          label: "people.batchGet(dm-partners)",
+        });
+        for (const [uid, name] of resolved) {
+          if (!globalSenderMap[uid]) {
+            globalSenderMap[uid] = name;
+            senderMapDirty = true;
+          }
+        }
+        diag.peopleApiOrphans = orphanUids.size;
+        diag.peopleApiResolved = resolved.size;
+        log(`  People API: ${resolved.size}/${orphanUids.size} orphan DM partners resolved`);
+      } catch (err) {
+        diag.peopleApiOrphans = orphanUids.size;
+        diag.peopleApiResolved = 0;
+        diag.peopleApiError = err?.message;
+        log(`  People API failed: ${err?.message}`);
+      }
+    }
+
+    // Second pass: build perSpace[] using either the original displayName,
+    // an existing senderMap entry, or a freshly-resolved People API name.
+    // Self-detection: primary = userId match; fallback = frequency.
+    const nameFreq = {};
+    const perSpaceNames = [];
+    for (const { space, records } of perSpaceRecords) {
+      const names = [];
+      for (const rec of records) {
+        const n = rec.displayName || globalSenderMap[rec.uid] || null;
+        if (!n) continue;
+        if (rec.uid && !globalSenderMap[rec.uid]) {
+          globalSenderMap[rec.uid] = n;
           senderMapDirty = true;
         }
-        if (isSelfMember(m)) { selfNames.add(n); continue; } // authoritative skip
+        if (isSelfMember(rec.member)) { selfNames.add(n); continue; }
         names.push(n);
         nameFreq[n] = (nameFreq[n] || 0) + 1;
       }
-      perSpaceNames.push({ space: r.value.space, names });
+      perSpaceNames.push({ space, names });
     }
     // Fallback heuristic — only add names that appear in >1 DM (almost
     // certainly self). Skip if authoritative identity already resolved self.
@@ -463,7 +536,7 @@ async function buildNameCache() {
     diag.selfSource = selfIdentity?.source || "frequency";
     if (selfNames.size > 0) log(`  Self (source=${diag.selfSource}): ${[...selfNames].join(", ")}`);
 
-    // Second pass: add only non-self names; also build dmLabels map.
+    // Third pass: add only non-self names; build dmLabels.
     let hits = 0, emptyDms = 0;
     const labels = {};
     const members = {};
@@ -559,6 +632,8 @@ async function getMessages({ spaceName, pageSize = 25, filter = "" }) {
   ]);
   const messages = res.data.messages || [];
   harvestIntoGlobal(messages);
+  // People API safety net: resolve any senders still missing after @mention harvest.
+  await enrichOrphansViaPeopleAPI(messages, "people.batchGet(get_messages)");
   return messages.map((m) => formatMessage(m, senderMap));
 }
 
@@ -570,6 +645,8 @@ async function getMessage({ messageName }) {
   );
   const spaceName = spaceNameFromMessage(res.data?.name);
   const senderMap = spaceName ? await ensureSenderMap(spaceName) : {};
+  // Single-message orphan resolution.
+  await enrichOrphansViaPeopleAPI([res.data], "people.batchGet(get_message)");
   return formatMessage(res.data, senderMap);
 }
 
@@ -697,7 +774,9 @@ async function searchMessages({ query, pageSize = 25, sinceDays }) {
         { label: `messages.list(${space.name})`, maxAttempts: 2 },
       );
       const senderMap = await ensureSenderMap(space.name);
-      for (const m of msgsRes.data.messages || []) pushHit(m, space, senderMap);
+      const msgs = msgsRes.data.messages || [];
+      await enrichOrphansViaPeopleAPI(msgs, "people.batchGet(search-browse)");
+      for (const m of msgs) pushHit(m, space, senderMap);
       return results.slice(0, pageSize);
     }
 
@@ -706,6 +785,7 @@ async function searchMessages({ query, pageSize = 25, sinceDays }) {
         const { hits } = await scanSpaceForText(space, { lower, timeFilter, textFilter: true, budget });
         if (!hits.length) return;
         const senderMap = await ensureSenderMap(space.name);
+        await enrichOrphansViaPeopleAPI(hits, "people.batchGet(search-targeted)");
         for (const m of hits) pushHit(m, space, senderMap);
       } catch {}
     }));
@@ -722,6 +802,7 @@ async function searchMessages({ query, pageSize = 25, sinceDays }) {
       const { hits } = await scanSpaceForText(space, { lower, timeFilter, textFilter: true, budget });
       if (!hits.length) return;
       const senderMap = await ensureSenderMap(space.name);
+      await enrichOrphansViaPeopleAPI(hits, "people.batchGet(search-global)");
       for (const m of hits) pushHit(m, space, senderMap);
     } catch {}
   }));
@@ -784,11 +865,41 @@ async function getSpace({ spaceName }) {
         maxAttempts: 3,
       });
       const memberships = m.memberships;
-      const allNames = memberships.map(x => x.member?.displayName).filter(Boolean);
+
+      // Under user auth, members.list returns null displayName for DMs. Capture
+      // user IDs and let People API fill the names so this surface matches
+      // what list_spaces returns for the same DM.
+      const orphanUids = new Set();
+      for (const x of memberships) {
+        const uid = x.member?.name;
+        if (uid && uid.startsWith("users/") && !x.member?.displayName && !globalSenderMap[uid]) {
+          orphanUids.add(uid);
+        }
+      }
+      if (orphanUids.size > 0 && CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN) {
+        try {
+          const resolved = await resolveViaDirectory(getPeople(), orphanUids, {
+            withRetry,
+            label: "people.batchGet(get_space)",
+          });
+          for (const [uid, name] of resolved) {
+            if (!globalSenderMap[uid]) {
+              globalSenderMap[uid] = name;
+              senderMapDirty = true;
+            }
+          }
+          if (resolved.size > 0) schedulePersistSenderMap();
+        } catch (err) {
+          log(`get_space People API failed: ${err?.message}`);
+        }
+      }
+
+      const nameOf = (x) => x.member?.displayName || (x.member?.name && globalSenderMap[x.member.name]) || null;
+      const allNames = memberships.map(nameOf).filter(Boolean);
       // Use authoritative isSelfMember check (userId match), fall back to name match.
       const otherNames = memberships
-        .filter(x => !isSelfMember(x) && !selfNames.has(x.member?.displayName))
-        .map(x => x.member?.displayName)
+        .filter(x => !isSelfMember(x) && !selfNames.has(nameOf(x)))
+        .map(nameOf)
         .filter(Boolean);
       dmMembers[spaceName] = allNames;
       const labelNames = otherNames.length ? otherNames : allNames;
@@ -1041,7 +1152,7 @@ async function handleMessage(msg) {
 
   if (method === "initialize") {
     const clientVersion = params?.protocolVersion || "2024-11-05";
-    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.15.0" } } });
+    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.16.0" } } });
     return;
   }
   if (method?.startsWith("notifications/")) return;
