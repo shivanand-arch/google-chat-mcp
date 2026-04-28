@@ -4,11 +4,24 @@
 // The interface is async in both modes so callers don't branch.
 //
 // Keys (Redis): gc-mcp:client:*, gc-mcp:pending:*, gc-mcp:code:*,
-// gc-mcp:access:*, gc-mcp:refresh:*
+// gc-mcp:access:*, gc-mcp:refresh:*, gc-mcp:senderMap:*
 
 import crypto from "crypto";
 
 const rand = (bytes = 32) => crypto.randomBytes(bytes).toString("base64url");
+
+// Stable, non-secret key derived from a user's refresh token (or any
+// stable per-user identifier). We never store the raw token in keys —
+// hashing keeps Redis dumps free of OAuth secrets even if they leak.
+export function senderMapKey(userIdentifier) {
+  if (!userIdentifier) return null;
+  return crypto.createHash("sha256").update(userIdentifier).digest("hex").slice(0, 16);
+}
+
+// Cap on how many resolved IDs we persist per user — name resolution is
+// long-tail (most active orgs <2k unique posters); 10k is a safety bound,
+// not a target. Above this we LRU-trim the oldest entries on save.
+const SENDER_MAP_MAX = 10000;
 
 // ── In-memory backend ───────────────────────────────────────────────────────
 function makeMemoryStorage() {
@@ -17,6 +30,7 @@ function makeMemoryStorage() {
   const accessTokens = new Map();
   const refreshTokens = new Map();
   const clients = new Map();
+  const senderMaps = new Map(); // userKey → { "users/X": "Name", ... }
 
   // GC expired entries once a minute — keeps memory bounded.
   setInterval(() => {
@@ -88,6 +102,24 @@ function makeMemoryStorage() {
       refreshTokens.delete(token);
       return data;
     },
+
+    // ── Sender-name resolution map (persisted across sessions on Redis;
+    //    process-lifetime only on memory). Keyed by a hashed per-user token. ──
+    async getSenderMap(userKey) {
+      if (!userKey) return {};
+      return senderMaps.get(userKey) || {};
+    },
+    async saveSenderMap(userKey, map) {
+      if (!userKey || !map) return;
+      // Cheap LRU-ish trim: if oversized, drop oldest insertion-order entries.
+      let toStore = map;
+      const ids = Object.keys(map);
+      if (ids.length > SENDER_MAP_MAX) {
+        toStore = {};
+        for (const id of ids.slice(-SENDER_MAP_MAX)) toStore[id] = map[id];
+      }
+      senderMaps.set(userKey, toStore);
+    },
   };
 }
 
@@ -110,6 +142,7 @@ async function makeRedisStorage(redisUrl) {
     code: (c) => `gc-mcp:code:${c}`,
     access: (t) => `gc-mcp:access:${t}`,
     refresh: (t) => `gc-mcp:refresh:${t}`,
+    senderMap: (u) => `gc-mcp:senderMap:${u}`,
   };
 
   async function setJson(key, value, ttlSeconds) {
@@ -181,6 +214,22 @@ async function makeRedisStorage(redisUrl) {
     },
     async takeRefreshToken(token) {
       return await takeJson(K.refresh(token));
+    },
+
+    // ── Sender-name resolution map (persisted, no TTL — names don't expire) ──
+    async getSenderMap(userKey) {
+      if (!userKey) return {};
+      return (await getJson(K.senderMap(userKey))) || {};
+    },
+    async saveSenderMap(userKey, map) {
+      if (!userKey || !map) return;
+      let toStore = map;
+      const ids = Object.keys(map);
+      if (ids.length > SENDER_MAP_MAX) {
+        toStore = {};
+        for (const id of ids.slice(-SENDER_MAP_MAX)) toStore[id] = map[id];
+      }
+      await setJson(K.senderMap(userKey), toStore);
     },
   };
 }

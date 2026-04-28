@@ -9,6 +9,7 @@ import { formatMessage } from "./shared/format.js";
 import { aggregateThreadsInSpace } from "./shared/threads-aggregate.js";
 import { listAllMembers } from "./shared/members-list.js";
 import { assertSpaceType } from "./shared/space-type-guard.js";
+import { senderMapKey } from "./storage.js";
 
 function makeChatClient({ google: g, googleClientId, googleClientSecret }) {
   const oauth2 = new google.auth.OAuth2(googleClientId, googleClientSecret);
@@ -135,15 +136,22 @@ function makeSessionCache() {
     nameCache: null,
     dmLabels: {},
     dmMembers: {},
-    senderMaps: {}, // spaceName → { "users/XXX": "Display Name" }
+    // Global sender resolver. One map shared across ALL spaces — a user
+    // @mentioned in space A is resolvable in space B without a fresh API call.
+    // Hydrated lazily from storage on first use (see ensureSenderMap).
+    globalSenderMap: null,           // { "users/XXX": "Display Name" } | null = unloaded
+    spacesWarmed: new Set(),         // spaces whose recent 200 msgs we've already harvested this session
+    senderMapDirty: false,           // set when harvest adds new keys; persistence schedules a save
     selfNames: new Set(),
-    selfIdentity: null, // { userId, email, name, source }
+    selfIdentity: null,              // { userId, email, name, source }
+    _storage: null,                  // injected per-call so we can persist
+    _userKey: null,                  // hashed per-user key for storage
   };
 }
 
 const sessionCaches = new Map();
 
-function getOrCreateCache(session) {
+function getOrCreateCache(session, storage) {
   const key = session?.google?.refreshToken || session?.user?.sub || "anonymous";
   let cache = sessionCaches.get(key);
   if (!cache) {
@@ -159,6 +167,10 @@ function getOrCreateCache(session) {
     }
     sessionCaches.set(key, cache);
   }
+  // Refresh storage handle every call — it's stable per process, but session
+  // caches predate it so we attach lazily. Same for the userKey (hashed).
+  if (storage) cache._storage = storage;
+  if (!cache._userKey) cache._userKey = senderMapKey(key);
   return cache;
 }
 
@@ -185,21 +197,75 @@ function harvestAnnotations(messages, map) {
   }
 }
 
-async function ensureSenderMap(chat, cache, spaceName) {
-  if (!cache.senderMaps) cache.senderMaps = {};
-  if (cache.senderMaps[spaceName]) return cache.senderMaps[spaceName];
-  const map = {};
-  try {
-    const res = await withRetry(
-      () => chat.spaces.messages.list({ parent: spaceName, pageSize: 200, orderBy: "createTime desc" }),
-      { label: `messages.list(sender-warmup:${spaceName})`, maxAttempts: 2 },
-    );
-    harvestAnnotations(res.data.messages || [], map);
-  } catch (err) {
-    console.log("[senderMap.err]", JSON.stringify({ spaceName, error: err?.message }));
+// Lazily hydrate the global sender map from storage on first access.
+// Returns the (always-shared) map; never the stale per-space copy.
+async function getGlobalSenderMap(cache) {
+  if (cache.globalSenderMap) return cache.globalSenderMap;
+  let hydrated = {};
+  if (cache._storage?.getSenderMap && cache._userKey) {
+    try {
+      hydrated = await cache._storage.getSenderMap(cache._userKey) || {};
+    } catch (err) {
+      console.log("[senderMap.hydrate.err]", err?.message);
+    }
   }
-  cache.senderMaps[spaceName] = map;
+  cache.globalSenderMap = hydrated;
+  return cache.globalSenderMap;
+}
+
+// Best-effort, debounced persist. Coalesces multiple harvests in a single
+// turn into one Redis write — relevant for search_messages which scans many
+// spaces in parallel.
+function schedulePersistSenderMap(cache) {
+  if (!cache._storage?.saveSenderMap || !cache._userKey) return;
+  if (cache._persistTimer) return;
+  cache._persistTimer = setTimeout(async () => {
+    cache._persistTimer = null;
+    if (!cache.senderMapDirty) return;
+    cache.senderMapDirty = false;
+    try {
+      await cache._storage.saveSenderMap(cache._userKey, cache.globalSenderMap);
+    } catch (err) {
+      console.log("[senderMap.persist.err]", err?.message);
+    }
+  }, 250);
+  // Don't keep the event loop alive just for this — Node will let it fire on shutdown.
+  if (cache._persistTimer.unref) cache._persistTimer.unref();
+}
+
+async function ensureSenderMap(chat, cache, spaceName) {
+  const map = await getGlobalSenderMap(cache);
+  // First touch of a space this session → harvest its recent @mentions once.
+  if (!cache.spacesWarmed.has(spaceName)) {
+    const before = Object.keys(map).length;
+    try {
+      const res = await withRetry(
+        () => chat.spaces.messages.list({ parent: spaceName, pageSize: 200, orderBy: "createTime desc" }),
+        { label: `messages.list(sender-warmup:${spaceName})`, maxAttempts: 2 },
+      );
+      harvestAnnotations(res.data.messages || [], map);
+    } catch (err) {
+      console.log("[senderMap.err]", JSON.stringify({ spaceName, error: err?.message }));
+    }
+    cache.spacesWarmed.add(spaceName);
+    if (Object.keys(map).length > before) {
+      cache.senderMapDirty = true;
+      schedulePersistSenderMap(cache);
+    }
+  }
   return map;
+}
+
+// Wrapper for harvestAnnotations call sites that mutate the senderMap directly
+// (e.g. getMessages, after fetching the page being shown to the user).
+// Marks the cache dirty so the new mentions get persisted.
+function harvestIntoCache(messages, cache, map) {
+  const before = Object.keys(map).length;
+  harvestAnnotations(messages, map);
+  if (Object.keys(map).length > before) {
+    cache.senderMapDirty = true;
+    schedulePersistSenderMap(cache);
+  }
 }
 
 // Derive the parent space from a message resource name like
@@ -248,6 +314,12 @@ async function buildNameCache(chat, cache) {
   const spaces = await ensureSpacesRaw(chat, cache);
   const nc = {};
   const dmLabels = {}; // spaceName → "Person A, Person B" (non-self members)
+  // Pre-load the global sender map so DM-member displayNames we resolve below
+  // also feed the cross-space sender resolver. members.list exposes
+  // displayName ONLY for DMs under user auth, so this is the cheapest place
+  // to harvest userId → name mappings before relying on @mention scraping.
+  const senderMap = await getGlobalSenderMap(cache);
+  let senderMapBefore = Object.keys(senderMap).length;
 
   // 1. Resolve DM names first so their first-name tokens (e.g. "priya") win
   //    over any same-named keyword in a group space.
@@ -306,6 +378,11 @@ async function buildNameCache(chat, cache) {
         }
         const n = m.member?.displayName;
         if (!n) continue;
+        // Seed the global sender resolver. m.member.name is "users/<ID>" — the
+        // exact key formatMessage() looks up. Don't overwrite existing entries
+        // (a fresher @mention name should win over a stale member record).
+        const uid = m.member?.name;
+        if (uid && !senderMap[uid]) senderMap[uid] = n;
         allNames.push(n);
         if (isSelfMember(m, cache)) { cache.selfNames.add(n); continue; }
         names.push(n);
@@ -333,6 +410,11 @@ async function buildNameCache(chat, cache) {
   }
 
   diag.dmLabelsCount = Object.keys(dmLabels).length;
+  diag.senderMapAdded = Object.keys(senderMap).length - senderMapBefore;
+  if (diag.senderMapAdded > 0) {
+    cache.senderMapDirty = true;
+    schedulePersistSenderMap(cache);
+  }
   console.log("[buildNameCache]", JSON.stringify(diag));
 
   // 2. Then group/named spaces. Full-name keys still set; word-level keys only
@@ -358,7 +440,7 @@ async function getMessages(chat, cache, { spaceName, pageSize = 25, filter = "" 
     ensureSenderMap(chat, cache, spaceName),
   ]);
   const messages = res.data.messages || [];
-  harvestAnnotations(messages, senderMap);
+  harvestIntoCache(messages, cache, senderMap);
   return messages.map((m) => formatMessage(m, senderMap));
 }
 
@@ -439,7 +521,10 @@ async function refreshCache(chat, cache) {
   cache.nameCache = null;
   cache.dmLabels = {};
   cache.dmMembers = {};
-  cache.senderMaps = {};
+  // Drop the warmed-spaces marker so the next get_messages re-harvests fresh
+  // @mentions, but KEEP the global sender map — names don't go stale, and
+  // wiping it would force every cross-space resolution to start from zero.
+  cache.spacesWarmed = new Set();
   cache.selfNames = new Set();
   // keep selfIdentity from OAuth session — it doesn't change per call.
   if (cache.selfIdentity?.name) cache.selfNames.add(cache.selfIdentity.name);
@@ -848,11 +933,11 @@ const HANDLERS = {
   debug_dm_resolution: debugDmResolution,
 };
 
-export async function callTool({ name, args, session, googleClientId, googleClientSecret }) {
+export async function callTool({ name, args, session, googleClientId, googleClientSecret, storage }) {
   const handler = HANDLERS[name];
   if (!handler) throw new Error(`Unknown tool: ${name}`);
   const chat = makeChatClient({ google: session.google, googleClientId, googleClientSecret });
-  const cache = getOrCreateCache(session);
+  const cache = getOrCreateCache(session, storage);
   try {
     return await handler(chat, cache, args || {});
   } catch (err) {

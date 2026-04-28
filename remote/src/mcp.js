@@ -5,7 +5,7 @@
 import { TOOLS, callTool } from "./tools.js";
 
 const PROTOCOL_VERSION = "2024-11-05";
-const SERVER_INFO = { name: "google-chat", version: "0.10.0" };
+const SERVER_INFO = { name: "google-chat", version: "0.11.0" };
 
 function jsonRpcError(id, code, message) {
   return { jsonrpc: "2.0", id: id ?? null, error: { code, message } };
@@ -59,6 +59,7 @@ export function createMcpHandler({ googleClientId, googleClientSecret, storage }
             name, args,
             session: token, // { google, user, cache? }
             googleClientId, googleClientSecret,
+            storage,
           });
           return res.json(jsonRpcResult(id, {
             content: [{ type: "text", text: JSON.stringify(result, null, 2) }],

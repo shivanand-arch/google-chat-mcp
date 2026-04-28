@@ -27,7 +27,9 @@ import { dirname, join } from "path";
 
 const CACHE_DIR = join(homedir(), ".config", "google-chat-mcp");
 const CACHE_PATH = join(CACHE_DIR, "cache.json");
-const CACHE_VERSION = 1;
+// v2 adds globalSenderMap (userId → displayName, shared across all spaces).
+// v1 caches load-but-treat-as-missing this field, so old caches still warm-start.
+const CACHE_VERSION = 2;
 const DEFAULT_TTL_MS = 6 * 60 * 60 * 1000; // 6h — stale beyond this triggers refresh
 
 /**
@@ -40,19 +42,26 @@ const DEFAULT_TTL_MS = 6 * 60 * 60 * 1000; // 6h — stale beyond this triggers 
  * @property {Record<string, string>} dmLabels
  * @property {Record<string, string[]>} dmMembers
  * @property {string[]} selfNames
+ * @property {Record<string, string>} globalSenderMap — userId → displayName, accumulated across all spaces
  */
 
 function ensureDir() {
   try { mkdirSync(CACHE_DIR, { recursive: true }); } catch { /* dir exists */ }
 }
 
-/** Load cached state. Returns null if missing, malformed, wrong version, or wrong user. */
+/** Load cached state. Returns null if missing, malformed, or wrong user.
+ *  Older versions are accepted (forward-compatible) — missing fields just
+ *  start empty rather than blocking warm-start on a schema bump. */
 export function loadCache(currentUserId) {
   if (!existsSync(CACHE_PATH)) return null;
   try {
     const raw = readFileSync(CACHE_PATH, "utf8");
     const data = JSON.parse(raw);
-    if (data?.version !== CACHE_VERSION) return null;
+    if (typeof data?.version !== "number") return null;
+    // Future-version caches (e.g. someone downgraded the binary) are dropped —
+    // we don't know what shape they hold. Older versions: accept and let the
+    // missing fields default to empty.
+    if (data.version > CACHE_VERSION) return null;
     if (currentUserId && data.userId && data.userId !== currentUserId) return null;
     if (!Array.isArray(data.spaces)) return null;
     return data;
@@ -76,6 +85,7 @@ export function saveCache(state) {
     dmLabels: state.dmLabels || {},
     dmMembers: state.dmMembers || {},
     selfNames: Array.isArray(state.selfNames) ? state.selfNames : [...(state.selfNames || [])],
+    globalSenderMap: state.globalSenderMap || {},
   };
   const tmp = `${CACHE_PATH}.tmp`;
   writeFileSync(tmp, JSON.stringify(payload), "utf8");
