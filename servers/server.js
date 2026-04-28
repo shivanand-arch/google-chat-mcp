@@ -207,7 +207,15 @@ let nameCache = null;
 let dmLabels = {}; // spaceName → "Person A, Person B" (non-self members of each DM)
 let selfNames = new Set(); // display names of self — seeded from selfIdentity when available
 let dmMembers = {}; // spaceName → array of raw member displayNames (for get_space responses)
-let senderMaps = {}; // spaceName → { "users/XXX": "Display Name" } for sender-name enrichment
+// Global sender resolver. Single map keyed by users/<ID> across the entire
+// account — a user @mentioned in space A becomes resolvable in space B with
+// no extra API call. Persisted to disk so name resolution strengthens over
+// time instead of starting from zero on every restart.
+let globalSenderMap = {};
+// Spaces whose recent 200 msgs we've already harvested THIS process. We only
+// want one warmup per space per restart; persisted names live in globalSenderMap.
+let spacesWarmed = new Set();
+let senderMapDirty = false; // set true when harvest adds new keys; saveCache flushes it
 let lastDiag = null; // diagnostics from last buildNameCache run, exposed via debug_dm_resolution
 
 // Stable per-account fingerprint for the on-disk cache. Hashing the refresh
@@ -236,10 +244,14 @@ function warmFromDisk() {
   dmLabels = cached.dmLabels || {};
   dmMembers = cached.dmMembers || {};
   selfNames = new Set(cached.selfNames || []);
+  // Sender-name resolutions are sticky across restarts — display names don't
+  // expire. v1 caches don't have this field; we just start fresh.
+  globalSenderMap = cached.globalSenderMap || {};
   const ageMin = Math.round((Date.now() - cached.savedAt) / 60000);
   const stale = isStale(cached);
   log(`Warm-started from ${CACHE_FILE_PATH} (${cached.spaces?.length || 0} spaces, ` +
-      `${Object.keys(cached.nameCache || {}).length} name keys, age ${ageMin}m${stale ? ", stale" : ""})`);
+      `${Object.keys(cached.nameCache || {}).length} name keys, ` +
+      `${Object.keys(globalSenderMap).length} resolved senders, age ${ageMin}m${stale ? ", stale" : ""})`);
 }
 
 // Chat API omits sender.displayName under user-auth. But USER_MENTION
@@ -262,20 +274,65 @@ function harvestAnnotations(messages, map) {
   }
 }
 
+// Debounced disk write — coalesces multiple harvests in one tool call into
+// one cache.json rewrite. Best-effort: a write failure leaves the in-memory
+// map intact, so the user keeps the benefit until the next successful save.
+let _persistTimer = null;
+function schedulePersistSenderMap() {
+  if (_persistTimer) return;
+  _persistTimer = setTimeout(() => {
+    _persistTimer = null;
+    if (!senderMapDirty) return;
+    senderMapDirty = false;
+    try {
+      saveCache({
+        userId: getUserFingerprint(),
+        spaces: allSpacesRaw || [],
+        nameCache: nameCache || {},
+        dmLabels,
+        dmMembers,
+        selfNames: [...selfNames],
+        globalSenderMap,
+      });
+    } catch (e) {
+      log(`local-cache senderMap save failed: ${e.message}`);
+    }
+  }, 250);
+  if (_persistTimer.unref) _persistTimer.unref();
+}
+
 async function ensureSenderMap(spaceName) {
-  if (senderMaps[spaceName]) return senderMaps[spaceName];
-  const map = {};
-  try {
-    const res = await withRetry(
-      () => getChat().spaces.messages.list({ parent: spaceName, pageSize: 200, orderBy: "createTime desc" }),
-      { label: `messages.list(sender-warmup:${spaceName})`, maxAttempts: 2 },
-    );
-    harvestAnnotations(res.data.messages || [], map);
-  } catch (err) {
-    log(`[senderMap.err] ${spaceName}: ${err?.message}`);
+  // First touch of this space this process → harvest its recent @mentions.
+  // Subsequent calls hit the cached resolver without an API round-trip.
+  if (!spacesWarmed.has(spaceName)) {
+    const before = Object.keys(globalSenderMap).length;
+    try {
+      const res = await withRetry(
+        () => getChat().spaces.messages.list({ parent: spaceName, pageSize: 200, orderBy: "createTime desc" }),
+        { label: `messages.list(sender-warmup:${spaceName})`, maxAttempts: 2 },
+      );
+      harvestAnnotations(res.data.messages || [], globalSenderMap);
+    } catch (err) {
+      log(`[senderMap.err] ${spaceName}: ${err?.message}`);
+    }
+    spacesWarmed.add(spaceName);
+    if (Object.keys(globalSenderMap).length > before) {
+      senderMapDirty = true;
+      schedulePersistSenderMap();
+    }
   }
-  senderMaps[spaceName] = map;
-  return map;
+  return globalSenderMap;
+}
+
+// For call sites that mutate the senderMap directly (e.g. getMessages, after
+// fetching the page being shown). Records dirty state so persistence runs.
+function harvestIntoGlobal(messages) {
+  const before = Object.keys(globalSenderMap).length;
+  harvestAnnotations(messages, globalSenderMap);
+  if (Object.keys(globalSenderMap).length > before) {
+    senderMapDirty = true;
+    schedulePersistSenderMap();
+  }
 }
 
 function spaceNameFromMessage(messageName) {
@@ -381,6 +438,15 @@ async function buildNameCache() {
         }
         const n = m.member?.displayName;
         if (!n) continue;
+        // Seed the global sender resolver. m.member.name = "users/<ID>", which
+        // is exactly the key formatMessage() needs. DM members are the only
+        // place members.list exposes displayName under user auth, so this is
+        // the cheapest userId → name harvest available.
+        const uid = m.member?.name;
+        if (uid && !globalSenderMap[uid]) {
+          globalSenderMap[uid] = n;
+          senderMapDirty = true;
+        }
         if (isSelfMember(m)) { selfNames.add(n); continue; } // authoritative skip
         names.push(n);
         nameFreq[n] = (nameFreq[n] || 0) + 1;
@@ -444,7 +510,11 @@ async function buildNameCache() {
       dmLabels,
       dmMembers,
       selfNames: [...selfNames],
+      globalSenderMap,
     });
+    // The fresh save flushed any pending dirty bits — clear so the next
+    // 250ms tick doesn't redundantly rewrite identical bytes.
+    senderMapDirty = false;
   } catch (e) { log(`local-cache save failed: ${e.message}`); }
   return cache;
 }
@@ -488,7 +558,7 @@ async function getMessages({ spaceName, pageSize = 25, filter = "" }) {
     ensureSenderMap(spaceName),
   ]);
   const messages = res.data.messages || [];
-  harvestAnnotations(messages, senderMap);
+  harvestIntoGlobal(messages);
   return messages.map((m) => formatMessage(m, senderMap));
 }
 
@@ -879,7 +949,11 @@ async function refreshCache() {
   nameCache = null;
   dmLabels = {};
   dmMembers = {};
-  senderMaps = {};
+  // Drop the warmed-spaces marker so the next get_messages re-harvests fresh
+  // @mentions. KEEP globalSenderMap — names don't go stale, and clearing it
+  // would force every cross-space resolution back to raw user IDs until the
+  // resolver re-warms.
+  spacesWarmed = new Set();
   selfNames = new Set();
   selfIdentity = null;
   lastDiag = null;
