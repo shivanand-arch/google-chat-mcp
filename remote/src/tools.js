@@ -605,8 +605,39 @@ async function refreshCache(chat, cache) {
   cache.selfNames = new Set();
   // keep selfIdentity from OAuth session — it doesn't change per call.
   if (cache.selfIdentity?.name) cache.selfNames.add(cache.selfIdentity.name);
+  // Mark the explicit refresh so auto-refresh-on-miss respects the cooldown.
+  cache._lastForceRefresh = Date.now();
   await buildNameCache(chat, cache);
   return { refreshed: true, spaces: cache.spaces.length, self: cache.selfIdentity };
+}
+
+// Auto-refresh-on-miss for find_dm / send_to_person. When a person isn't found
+// in the cached nameCache, the DM may have been created after our last
+// spaces.list — common when the user just opened a new DM. We invalidate the
+// space-derived caches and rebuild, gated by a cooldown so a legitimate
+// "this person doesn't exist" query doesn't hammer the API on every retry.
+//
+// What we wipe: spaces, nameCache, dmLabels, dmMembers, spacesWarmed.
+// What we keep: globalSenderMap (accumulated user IDs are still valid),
+// selfIdentity (OAuth session, doesn't change), selfNames (re-derived).
+const SPACES_REFRESH_COOLDOWN_MS = 60_000;
+async function refreshSpacesAndCache(chat, cache, { reason } = {}) {
+  const now = Date.now();
+  const last = cache._lastForceRefresh || 0;
+  if (now - last < SPACES_REFRESH_COOLDOWN_MS) {
+    return { refreshed: false, reason: "cooldown", waitedMs: now - last };
+  }
+  cache._lastForceRefresh = now;
+  console.log("[refreshSpacesAndCache]", JSON.stringify({ reason: reason || "unspecified" }));
+  cache.spaces = null;
+  cache.nameCache = null;
+  cache.dmLabels = {};
+  cache.dmMembers = {};
+  cache.spacesWarmed = new Set();
+  cache.selfNames = new Set();
+  if (cache.selfIdentity?.name) cache.selfNames.add(cache.selfIdentity.name);
+  await buildNameCache(chat, cache);
+  return { refreshed: true, reason: reason || "miss" };
 }
 
 // Tokens too short or too common to be meaningful name-matches.
@@ -946,7 +977,16 @@ function formatAmbiguousError(personName, resolved) {
 }
 
 async function findDm(chat, cache, { personName }) {
-  const resolved = await resolvePersonToDm(chat, cache, personName);
+  let resolved = await resolvePersonToDm(chat, cache, personName);
+  // Cache miss → DM may have been created after our last spaces.list. One
+  // auto-refresh (cooldown-gated), then retry. We don't retry on `ambiguous`
+  // because more entries won't help disambiguate; only on outright null.
+  if (!resolved) {
+    const r = await refreshSpacesAndCache(chat, cache, { reason: `find_dm:${personName}` });
+    if (r.refreshed) {
+      resolved = await resolvePersonToDm(chat, cache, personName);
+    }
+  }
   if (resolved?.ambiguous) {
     if (resolved.source === "name_cache") {
       return {
@@ -1004,7 +1044,15 @@ async function debugDmResolution(chat, cache) {
 }
 
 async function sendToPerson(chat, cache, { personName, text, threadName, cardsV2, messageId }) {
-  const resolved = await resolvePersonToDm(chat, cache, personName);
+  let resolved = await resolvePersonToDm(chat, cache, personName);
+  // Cache miss → auto-refresh once (cooldown-gated) then retry. Same rationale
+  // as findDm: handles the "I just opened a DM with X, now send to them" case.
+  if (!resolved) {
+    const r = await refreshSpacesAndCache(chat, cache, { reason: `send_to_person:${personName}` });
+    if (r.refreshed) {
+      resolved = await resolvePersonToDm(chat, cache, personName);
+    }
+  }
   if (resolved?.ambiguous) {
     throw new Error(formatAmbiguousError(personName, resolved));
   }
