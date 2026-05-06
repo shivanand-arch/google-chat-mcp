@@ -226,6 +226,7 @@ let globalSenderMap = {};
 let spacesWarmed = new Set();
 let senderMapDirty = false; // set true when harvest adds new keys; saveCache flushes it
 let lastDiag = null; // diagnostics from last buildNameCache run, exposed via debug_dm_resolution
+let lastForceRefresh = 0; // ms timestamp of last refreshSpacesAndCache; gates auto-refresh-on-miss
 
 // Stable per-account fingerprint for the on-disk cache. Hashing the refresh
 // token (not the access token, which rotates) gives us isolation if a user
@@ -1011,7 +1012,16 @@ async function resolvePersonToDm(personName) {
 }
 
 async function findDm({ personName }) {
-  const resolved = await resolvePersonToDm(personName);
+  let resolved = await resolvePersonToDm(personName);
+  // Cache miss → DM may have been created after our last spaces.list. One
+  // auto-refresh (cooldown-gated), then retry. Skip retry on `ambiguous`
+  // because more cache entries won't help disambiguate.
+  if (!resolved) {
+    const r = await refreshSpacesAndCache({ reason: `find_dm:${personName}` });
+    if (r.refreshed) {
+      resolved = await resolvePersonToDm(personName);
+    }
+  }
   if (resolved?.ambiguous) {
     if (resolved.source === "name_cache") {
       return {
@@ -1038,7 +1048,15 @@ async function findDm({ personName }) {
 }
 
 async function sendToPerson({ personName, text, threadName, cardsV2, messageId }) {
-  const resolved = await resolvePersonToDm(personName);
+  let resolved = await resolvePersonToDm(personName);
+  // Cache miss → auto-refresh once (cooldown-gated) then retry. Same rationale
+  // as findDm: handles the "I just opened a DM with X, now send to them" case.
+  if (!resolved) {
+    const r = await refreshSpacesAndCache({ reason: `send_to_person:${personName}` });
+    if (r.refreshed) {
+      resolved = await resolvePersonToDm(personName);
+    }
+  }
   if (resolved?.ambiguous) {
     throw new Error(formatAmbiguousError(personName, resolved));
   }
@@ -1068,8 +1086,34 @@ async function refreshCache() {
   selfNames = new Set();
   selfIdentity = null;
   lastDiag = null;
+  // Mark the explicit refresh so auto-refresh-on-miss respects the cooldown.
+  lastForceRefresh = Date.now();
   await buildNameCache();
   return { refreshed: true, spaces: allSpacesRaw.length, self: selfIdentity };
+}
+
+// Auto-refresh-on-miss for find_dm / send_to_person. When a person isn't
+// found in nameCache, the DM may have been created after our last spaces.list
+// — common when the user just opened a new DM. Invalidate the space-derived
+// caches and rebuild, gated by a cooldown so a legitimate "not found" query
+// doesn't hammer the API on every retry.
+const SPACES_REFRESH_COOLDOWN_MS = 60_000;
+async function refreshSpacesAndCache({ reason } = {}) {
+  const now = Date.now();
+  if (now - lastForceRefresh < SPACES_REFRESH_COOLDOWN_MS) {
+    return { refreshed: false, reason: "cooldown" };
+  }
+  lastForceRefresh = now;
+  log(`[refreshSpacesAndCache] ${reason || "unspecified"}`);
+  allSpacesRaw = null;
+  nameCache = null;
+  dmLabels = {};
+  dmMembers = {};
+  spacesWarmed = new Set();
+  // Don't wipe selfIdentity / selfNames — they're stable for the session
+  // (OIDC userinfo is identity, not space membership).
+  await buildNameCache();
+  return { refreshed: true, reason: reason || "miss" };
 }
 
 async function whoami() {
@@ -1152,7 +1196,7 @@ async function handleMessage(msg) {
 
   if (method === "initialize") {
     const clientVersion = params?.protocolVersion || "2024-11-05";
-    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.16.0" } } });
+    sendResponse({ jsonrpc: "2.0", id, result: { protocolVersion: clientVersion, capabilities: { tools: {} }, serverInfo: { name: "google-chat", version: "0.17.0" } } });
     return;
   }
   if (method?.startsWith("notifications/")) return;
