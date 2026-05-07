@@ -2,10 +2,11 @@
 
 Connect Claude to your Google Chat — read, search, summarise, and send messages across all your spaces and DMs.
 
-Works in **two modes**:
+Works in **three modes**:
 
 - **Claude Code CLI** — install as a local plugin, stdio transport. One user, local credentials.
 - **claude.ai / Claude Cowork connector** — self-hosted HTTP MCP server with OAuth. Any number of colleagues can connect their own Google account by clicking **Connect**.
+- **Cursor** (or any Streamable-HTTP MCP client) — point at the same self-hosted URL from Option B; OAuth flow runs automatically on first use.
 
 ---
 
@@ -132,11 +133,37 @@ Share the same URL with colleagues. Each click **Connect** and authorizes their 
 
 ---
 
-## Prerequisites (both modes)
+## Option C: Cursor (remote, HTTP + OAuth)
+
+Cursor speaks the same MCP Streamable-HTTP + OAuth 2.1 protocol as claude.ai, so the Railway deployment from Option B works as-is — no separate install, no refresh token, no env vars.
+
+Add this to `~/.cursor/mcp.json` (create the file if it doesn't exist):
+
+```json
+{
+  "mcpServers": {
+    "google-chat": {
+      "url": "https://<your-railway-url>/mcp"
+    }
+  }
+}
+```
+
+Replace `<your-railway-url>` with the Railway URL from Option B (e.g. `google-chat-mcp-production-16af.up.railway.app`).
+
+Restart Cursor. The first tool call will pop a browser window for Google sign-in (via the same OAuth flow Option B uses). After consent, the bearer token is cached in Cursor and reused.
+
+> Same prerequisites as Option B — the Railway server must already be deployed with `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `PUBLIC_URL` set, and the redirect URI must be registered on the Google OAuth client.
+
+The same pattern works for any Streamable-HTTP MCP client (Cline, Continue, etc.) — point at `https://<your-railway-url>/mcp` and let OAuth do the rest.
+
+---
+
+## Prerequisites (all modes)
 
 You need a Google Cloud project with:
 1. **Google Chat API** enabled
-2. OAuth2 credentials — **Desktop** type for Option A, **Web application** type for Option B
+2. OAuth2 credentials — **Desktop** type for Option A, **Web application** type for Options B and C
 3. Chat scopes on the consent screen (see above)
 
 ## What you get
