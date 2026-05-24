@@ -55,8 +55,12 @@ function validateResourceName(s, label = "name") {
 }
 
 // ── Retry with exponential backoff + jitter on 429/5xx ──
+// Per-attempt logs were dropped after a search_messages fan-out across hundreds
+// of spaces produced 429s on most of them and saturated Railway's 500 logs/sec
+// ceiling (and the heap with buffered log lines). Pass `metrics` from a fan-out
+// caller to accumulate retry/429/failure counts and emit ONE summary line.
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function withRetry(fn, { label = "api-call", maxAttempts = 4 } = {}) {
+async function withRetry(fn, { label = "api-call", maxAttempts = 4, metrics } = {}) {
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try { return await fn(); } catch (err) {
@@ -68,11 +72,41 @@ async function withRetry(fn, { label = "api-call", maxAttempts = 4 } = {}) {
       const retryAfterMs = retryAfterHdr && !isNaN(+retryAfterHdr) ? +retryAfterHdr * 1000 : 0;
       const backoff = Math.min(30000, 500 * Math.pow(2, attempt - 1));
       const delay = Math.max(retryAfterMs, backoff) + Math.random() * 250;
-      console.log(`[retry] ${label} ${code} attempt ${attempt}/${maxAttempts} waiting ${Math.round(delay)}ms`);
+      if (metrics) {
+        metrics.retries++;
+        if (code === 429) metrics.rateLimited++;
+      }
       await sleep(delay);
     }
   }
+  if (metrics) metrics.failures++;
+  else {
+    const code = lastErr?.code || lastErr?.response?.status;
+    console.log(`[retry-failed] ${label} ${code || "?"} after ${maxAttempts} attempts: ${lastErr?.message || lastErr}`);
+  }
   throw lastErr;
+}
+
+// Bounded-concurrency replacement for Promise.allSettled(items.map(fn)).
+// Spawns at most `limit` workers; each pulls the next index until the queue
+// drains. Returns settled results in input order so callers can swap drop-in.
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= items.length) return;
+      try {
+        results[idx] = { status: "fulfilled", value: await fn(items[idx], idx) };
+      } catch (reason) {
+        results[idx] = { status: "rejected", reason };
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 // ── Structured error normalization ──
@@ -644,14 +678,16 @@ async function refreshSpacesAndCache(chat, cache, { reason } = {}) {
 const SEARCH_STOPWORDS = new Set([
   "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "at", "by", "with",
 ]);
-// Accuracy > economy: don't cap fan-out. If 50 spaces match "ECC", we search all 50.
-// (withRetry + allSettled absorbs rate-limit blips; the caller can always narrow the query.)
+// Accuracy > economy on coverage — but bounded on concurrency so a 500-space
+// org doesn't fire 500 messages.list calls simultaneously and OOM the box on
+// 429 backoff buffers (this happened in production on 2026-05-23).
 const SEARCH_API_PAGE_SIZE = 100;           // messages per API page
 const SEARCH_MAX_PAGES_PER_SPACE = 6;       // per-space hard stop: 6 × 100 = 600 messages
 const SEARCH_TOTAL_MSG_BUDGET = 20000;      // org-wide safety net across all scanned spaces
 const SEARCH_RESULT_HARD_CAP = 200;         // ceiling on consolidated hits returned to caller
 const SEARCH_DEFAULT_SINCE_DAYS = 30;       // default time window for text grep
 const SEARCH_MAX_SINCE_DAYS = 365;          // clamp to protect runtime
+const SEARCH_FANOUT_CONCURRENCY = 6;        // max parallel space scans (rate-limit + memory guard)
 
 function tokenizeQuery(lower) {
   const toks = lower.split(/\s+/).filter((t) => t.length >= 2 && !SEARCH_STOPWORDS.has(t));
@@ -661,7 +697,7 @@ function tokenizeQuery(lower) {
 // Paginate through messages in a space within the time window, up to per-space cap.
 // Filters server-side via Google Chat API's `filter: "createTime > ..."` so quiet
 // spaces cost ~1 page, not 6. textFilter=false collects all messages (browse mode).
-async function scanSpaceForText(chat, space, { lower, timeFilter, textFilter = true, budget }) {
+async function scanSpaceForText(chat, space, { lower, timeFilter, textFilter = true, budget, metrics }) {
   const hits = [];
   let pageToken;
   let pages = 0;
@@ -676,7 +712,7 @@ async function scanSpaceForText(chat, space, { lower, timeFilter, textFilter = t
     if (timeFilter) params.filter = timeFilter;
     const r = await withRetry(
       () => chat.spaces.messages.list(params),
-      { label: `messages.list(${space.name})`, maxAttempts: 2 },
+      { label: `messages.list(${space.name})`, maxAttempts: 2, metrics },
     );
     const msgs = r.data.messages || [];
     pages++;
@@ -694,7 +730,7 @@ async function scanSpaceForText(chat, space, { lower, timeFilter, textFilter = t
   return { hits, pages, truncated };
 }
 
-async function searchMessages(chat, cache, { query, pageSize = 25, sinceDays }) {
+async function searchMessages(chat, cache, { query, pageSize = 25, sinceDays, global = false }) {
   const spaces = await ensureSpacesRaw(chat, cache);
   const lower = query.toLowerCase();
   const qTokens = tokenizeQuery(lower);
@@ -743,31 +779,46 @@ async function searchMessages(chat, cache, { query, pageSize = 25, sinceDays }) 
       return results.slice(0, pageSize);
     }
 
-    await Promise.allSettled(targets.map(async (space) => {
-      try {
-        const { hits } = await scanSpaceForText(chat, space, { lower, timeFilter, textFilter: true, budget });
-        if (!hits.length) return;
-        const senderMap = await ensureSenderMap(chat, cache, space.name);
-        await enrichOrphansViaPeopleAPI(hits, cache, senderMap, "people.batchGet(search-targeted)");
-        for (const m of hits) pushHit(m, space, senderMap);
-      } catch {}
-    }));
+    const metrics = { spaces: targets.length, hits: 0, retries: 0, rateLimited: 0, failures: 0 };
+    const settled = await mapWithConcurrency(targets, SEARCH_FANOUT_CONCURRENCY, async (space) => {
+      const { hits } = await scanSpaceForText(chat, space, { lower, timeFilter, textFilter: true, budget, metrics });
+      if (!hits.length) return;
+      metrics.hits += hits.length;
+      const senderMap = await ensureSenderMap(chat, cache, space.name);
+      await enrichOrphansViaPeopleAPI(hits, cache, senderMap, "people.batchGet(search-targeted)");
+      for (const m of hits) pushHit(m, space, senderMap);
+    });
+    for (const r of settled) if (r.status === "rejected") metrics.failures++;
+    console.log(`[search] targeted query="${query}" ${JSON.stringify(metrics)}`);
     results.sort((a, b) => new Date(b.createTime) - new Date(a.createTime));
     if (results.length > 0) {
       return results.slice(0, Math.min(SEARCH_RESULT_HARD_CAP, Math.max(pageSize, results.length)));
     }
   }
 
-  // No name-match hits anywhere → global text grep across every space within the time window.
-  await Promise.allSettled(spaces.map(async (space) => {
-    try {
-      const { hits } = await scanSpaceForText(chat, space, { lower, timeFilter, textFilter: true, budget });
-      if (!hits.length) return;
-      const senderMap = await ensureSenderMap(chat, cache, space.name);
-      await enrichOrphansViaPeopleAPI(hits, cache, senderMap, "people.batchGet(search-global)");
-      for (const m of hits) pushHit(m, space, senderMap);
-    } catch {}
-  }));
+  // No name-match hits → would need a global text grep across EVERY space in
+  // the window. That fan-out is what OOM-killed the container on 2026-05-23 —
+  // hundreds of parallel messages.list calls, all 429ing, all retrying. We now
+  // require an explicit opt-in so a vague query can't accidentally scan the
+  // entire org.
+  if (!global) {
+    throw new Error(
+      `No space name matched "${query}". To grep message bodies across all ${spaces.length} spaces, ` +
+      `retry with global: true (slower, may rate-limit). Better: narrow the query, or add sinceDays.`
+    );
+  }
+
+  const metrics = { spaces: spaces.length, hits: 0, retries: 0, rateLimited: 0, failures: 0 };
+  const settled = await mapWithConcurrency(spaces, SEARCH_FANOUT_CONCURRENCY, async (space) => {
+    const { hits } = await scanSpaceForText(chat, space, { lower, timeFilter, textFilter: true, budget, metrics });
+    if (!hits.length) return;
+    metrics.hits += hits.length;
+    const senderMap = await ensureSenderMap(chat, cache, space.name);
+    await enrichOrphansViaPeopleAPI(hits, cache, senderMap, "people.batchGet(search-global)");
+    for (const m of hits) pushHit(m, space, senderMap);
+  });
+  for (const r of settled) if (r.status === "rejected") metrics.failures++;
+  console.log(`[search] global query="${query}" ${JSON.stringify(metrics)}`);
   results.sort((a, b) => new Date(b.createTime) - new Date(a.createTime));
   return results.slice(0, Math.min(SEARCH_RESULT_HARD_CAP, Math.max(pageSize, results.length)));
 }

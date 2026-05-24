@@ -46,12 +46,14 @@ export const TOOLS = [
   {
     name: "search_messages",
     description:
-      "Search messages across ALL spaces the user is in, within a time window (default: last 30 days). " +
-      "Fan-out: (1) candidate spaces = every space whose displayName contains the full query or any " +
+      "Search messages across spaces the user is in, within a time window (default: last 30 days). " +
+      "Default mode: candidate spaces = every space whose displayName contains the full query or any " +
       "non-trivial token (e.g. \"panic room\" → every Panic Room space, \"ECC\" → every ECC space), " +
-      "then grep each in parallel with space labels on results; (2) if no label hits, fall back to " +
-      "global text grep across all spaces. Uses server-side createTime filter + paginates up to 600 " +
-      "messages per space. If a result is expected but not returned, widen the window via sinceDays.",
+      "then grep each in parallel (capped concurrency) with space labels on results. " +
+      "If no space name matches, the tool returns an error suggesting `global: true` — set that to " +
+      "grep message bodies across every space (slower, may rate-limit; prefer narrowing the query). " +
+      "Uses server-side createTime filter + paginates up to 600 messages per space. If a result is " +
+      "expected but not returned, widen the window via sinceDays before falling back to global.",
     inputSchema: {
       type: "object",
       properties: {
@@ -60,6 +62,12 @@ export const TOOLS = [
         sinceDays: {
           type: "number",
           description: "Look back this many days (default 30, max 365). Increase for older messages.",
+        },
+        global: {
+          type: "boolean",
+          description:
+            "Set true to grep message bodies across every space when no space name matches. " +
+            "Default false — guards against unbounded fan-out. Prefer narrowing the query first.",
         },
       },
       required: ["query"],
